@@ -46,8 +46,9 @@ class ClarifyingQuestion:
     explanation: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
+        clarif_type_val = self.clarification_type.value if hasattr(self.clarification_type, 'value') else str(self.clarification_type)
         return {
-            "type": self.clarification_type.value,
+            "type": clarif_type_val,
             "question": self.question_text,
             "options": self.options,
             "confidence": round(self.confidence_score, 2),

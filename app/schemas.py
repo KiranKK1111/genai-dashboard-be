@@ -33,7 +33,7 @@ class ClarificationQuestionBinary(BaseModel):
     """Binary yes/no clarification question."""
     type: Literal[ClarificationType.BINARY] = ClarificationType.BINARY
     question: str = Field(..., description="The clarification question")
-    # Example: "Did you mean 'transactions' instead of 'customer'?"
+    # Example: "Did you mean '<option_a>' instead of '<option_b>'?"
 
 
 class ClarificationQuestionMultipleChoice(BaseModel):
@@ -50,7 +50,7 @@ class ClarificationQuestionMissingParameter(BaseModel):
     question: str = Field(..., description="The clarification question")
     required_field: str = Field(..., description="The field name that is required")
     field_type: Optional[str] = Field(None, description="Type of the required field (e.g., date_range, string)")
-    # Example: "Please provide a date range for transactions." with required_field "date_range"
+    # Example: "Please provide a date range." with required_field "date_range"
 
 
 class ClarificationQuestionValueInput(BaseModel):
@@ -90,6 +90,233 @@ class ClarificationConfirmationRequest(BaseModel):
     confirmed: bool = Field(default=True, description="Whether user confirmed the clarification")
 
 
+# ============================================================================
+# Semantic Intent Routing (NEW - fully dynamic classification)
+# ============================================================================
+
+class Tool(str, Enum):
+    """Available tools/actions."""
+    CHAT = "CHAT"
+    ANALYZE_FILE = "ANALYZE_FILE"
+    RUN_SQL = "RUN_SQL"
+    MIXED = "MIXED"
+
+
+class FollowupType(str, Enum):
+    """Follow-up classification types."""
+    NEW_QUERY = "NEW_QUERY"
+    CHAT_FOLLOW_UP = "CHAT_FOLLOW_UP"
+    ANALYZE_FILE_FOLLOW_UP = "ANALYZE_FILE_FOLLOW_UP"
+    RUN_SQL_FOLLOW_UP = "RUN_SQL_FOLLOW_UP"
+
+
+class RunSQLFollowupSubtype(str, Enum):
+    """RUN_SQL follow-up subtypes (query modification operations)."""
+    ADD_FILTER = "ADD_FILTER"
+    REMOVE_FILTER = "REMOVE_FILTER"
+    CHANGE_GROUPING = "CHANGE_GROUPING"
+    CHANGE_METRIC = "CHANGE_METRIC"
+    SORT_OR_TOPK = "SORT_OR_TOPK"
+    EXPAND_COLUMNS = "EXPAND_COLUMNS"
+    DRILLDOWN = "DRILLDOWN"
+    PAGINATION = "PAGINATION"
+    SWITCH_ENTITY = "SWITCH_ENTITY"
+    FIX_ERROR = "FIX_ERROR"
+
+
+class AnalyzeFileFollowupSubtype(str, Enum):
+    """ANALYZE_FILE follow-up subtypes."""
+    ASK_MORE_DETAIL = "ASK_MORE_DETAIL"
+    ASK_SUMMARY_DIFFERENT_STYLE = "ASK_SUMMARY_DIFFERENT_STYLE"
+    ASK_SOURCE_CITATION = "ASK_SOURCE_CITATION"
+    COMPARE_SECTIONS = "COMPARE_SECTIONS"
+    EXTRACT_TABLE_ENTITIES = "EXTRACT_TABLE_ENTITIES"
+
+
+class ChatFollowupSubtype(str, Enum):
+    """CHAT follow-up subtypes."""
+    CLARIFY = "CLARIFY"
+    CONTINUE = "CONTINUE"
+    APPLY_PREVIOUS_ADVICE = "APPLY_PREVIOUS_ADVICE"
+    REPHRASE = "REPHRASE"
+    NEW_TOPIC_SAME_SESSION = "NEW_TOPIC_SAME_SESSION"
+
+
+class TurnStateArtifacts(BaseModel):
+    """
+    Artifacts persisted after tool execution.
+    Used to detect and classify follow-ups reliably.
+    """
+    # Common
+    tool_used: str = Field(..., description="Tool that was executed (RUN_SQL, ANALYZE_FILE, CHAT)")
+    
+    # SQL artifacts
+    sql: Optional[str] = Field(None, description="Generated SQL query")
+    sql_plan_json: Optional[Dict[str, Any]] = Field(None, description="QueryPlan AST (structured)")
+    tables: Optional[List[str]] = Field(None, description="Tables referenced in query")
+    filters: Optional[List[Dict[str, Any]]] = Field(None, description="WHERE clause filters")
+    grouping: Optional[List[str]] = Field(None, description="GROUP BY fields")
+    having: Optional[List[Dict[str, Any]]] = Field(None, description="HAVING clause conditions")
+    order_by: Optional[List[Dict[str, str]]] = Field(None, description="ORDER BY specification")
+    limit: Optional[int] = Field(None, description="LIMIT value if present")
+    result_schema: Optional[List[Dict[str, str]]] = Field(
+        None, 
+        description="Result schema [{name, type}, ...]"
+    )
+    row_count: Optional[int] = Field(None, description="Number of rows returned")
+    result_sample: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Sample of first few rows from result"
+    )
+    
+    # File artifacts
+    file_ids: Optional[List[str]] = Field(None, description="Files analyzed")
+    extracted_chunks: Optional[List[str]] = Field(None, description="Chunk IDs extracted")
+    extracted_summary: Optional[str] = Field(
+        None,
+        description="Short summary of derived facts from file"
+    )
+    
+    # Chat artifacts
+    chat_summary: Optional[str] = Field(
+        None,
+        description="Rolling summary of conversation"
+    )
+    confirmed_facts: Optional[List[str]] = Field(
+        None,
+        description="Facts confirmed by user in this turn"
+    )
+
+
+class TurnState(BaseModel):
+    """
+    Persistent state after each tool execution turn.
+    Core of the semantic routing system - enables reliable follow-up detection.
+    """
+    session_id: str = Field(..., description="Session ID")
+    turn_id: int = Field(..., description="Turn number in session (auto-incremented)")
+    user_query: str = Field(..., description="The user's query text")
+    assistant_summary: str = Field(
+        ...,
+        description="Short summary of what the assistant did/returned"
+    )
+    tool_used: Tool = Field(
+        ...,
+        description="Tool that was used to handle this turn"
+    )
+    artifacts: TurnStateArtifacts = Field(
+        ...,
+        description="Artifacts from tool execution (for follow-up detection)"
+    )
+    created_at: datetime = Field(default_factory=datetime.utcnow, description="Timestamp")
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Tool execution confidence score"
+    )
+
+
+class RouterSignals(BaseModel):
+    """
+    Hard signals used by the router for deterministic routing decisions.
+    These are objective, fast checks (not ML-based).
+    """
+    has_uploaded_files: bool = Field(
+        ...,
+        description="Are there files in this session?"
+    )
+    db_connected: bool = Field(
+        default=True,
+        description="Is the database available?"
+    )
+    last_tool_used: Optional[Tool] = Field(
+        None,
+        description="What tool was used in the last turn?"
+    )
+    last_sql_exists: bool = Field(
+        default=False,
+        description="Is there a previous SQL query to reference?"
+    )
+    last_file_context_exists: bool = Field(
+        default=False,
+        description="Are there file chunks from previous analysis?"
+    )
+    time_since_last_turn_seconds: Optional[int] = Field(
+        None,
+        description="Seconds since last turn (for session timeout detection)"
+    )
+
+
+class RouterDecision(BaseModel):
+    """
+    Semantic intent routing decision output.
+    
+    Produced by the LLM after analyzing:
+    1. Hard signals (db_connected, last_tool_used, etc.)
+    2. Last turn state (artifacts, summary)
+    3. Current user query
+    
+    This is a deterministic contract between router LLM and execution engine.
+    Gateway for "do we have enough info, or need clarification?"
+    """
+    tool: Tool = Field(
+        ...,
+        description="Primary tool to route to: CHAT, ANALYZE_FILE, RUN_SQL, or MIXED"
+    )
+    followup_type: FollowupType = Field(
+        ...,
+        description="Classification: NEW_QUERY or {TOOL}_FOLLOW_UP"
+    )
+    followup_subtype: Optional[str] = Field(
+        None,
+        description="Subtype of follow-up (e.g., ADD_FILTER, CHANGE_GROUPING, etc.)"
+    )
+    needs_clarification: bool = Field(
+        default=False,
+        description="Should we ask user for clarification before executing?"
+    )
+    clarification_questions: List[ClarificationQuestion] = Field(
+        default_factory=list,
+        description="Structured clarification questions if needs_clarification=True"
+    )
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Router confidence 0-1"
+    )
+    reasoning: str = Field(
+        ...,
+        description="Internal reasoning (for logging/debug)"
+    )
+    signals_used: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Which signals were used in decision"
+    )
+
+
+class RouterInput(BaseModel):
+    """
+    Input context sent to the router LLM.
+    Combines hard signals, last turn state, and current query.
+    """
+    user_query: str = Field(..., description="Current user query to classify")
+    hard_signals: RouterSignals = Field(..., description="Deterministic signal checks")
+    last_turn_summary: Optional[str] = Field(
+        None,
+        description="Summary of last turn (what was done, what was returned)"
+    )
+    last_turn_artifacts: Optional[TurnStateArtifacts] = Field(
+        None,
+        description="Artifacts from last turn (sql exists? file chunks? etc.)"
+    )
+    session_state: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Full session state if needed for context"
+    )
+
+
 # ----------------------------- Request models -----------------------------
 
 class NewSessionRequest(BaseModel):
@@ -107,6 +334,7 @@ class QueryRequest(BaseModel):
 # ----------------------------- Response models ---------------------------
 
 class BaseResponse(BaseModel):
+    id: Optional[str] = Field(None, description="Message ID from database (when persisted)")
     type: str = Field(..., description="Type of the response e.g. data_query, file_query")
     intent: str = Field(..., description="High level intent extracted from the query")
     confidence: Union[float, str] = Field(..., description="Model confidence score")
@@ -120,6 +348,9 @@ class BaseResponse(BaseModel):
     variations: Optional[List[str]] = Field(
         None, description="Optional list of alternative response variations for conversational responses"
     )
+    
+    class Config:
+        extra = "allow"  # Allow debug and other additional fields
 
 
 class DataQueryDataset(BaseModel):
@@ -173,6 +404,55 @@ class VisualizationConfig(BaseModel):
         extra = "allow"  # Allow arbitrary configuration options
 
 
+class ChartCustomization(BaseModel):
+    """
+    Advanced chart customization options for precise control.
+    Enables users to override AI defaults with specific styling.
+    """
+    # Color customization
+    colors: Optional[List[str]] = Field(None, description="Custom color palette (hex codes)")
+    theme: Optional[str] = Field(None, description="Theme: 'light', 'dark', 'auto', 'high_contrast'")
+    color_mapping: Optional[Dict[str, str]] = Field(None, description="Map specific values to colors")
+    
+    # Axes configuration
+    x_axis: Optional[Dict[str, Any]] = Field(None, description="X-axis config: {label, min, max, format, grid, logarithmic}")
+    y_axis: Optional[Dict[str, Any]] = Field(None, description="Y-axis config: {label, min, max, format, grid, logarithmic}")
+    secondary_y_axis: Optional[Dict[str, Any]] = Field(None, description="Secondary Y-axis for dual-axis charts")
+    
+    # Number formatting
+    number_format: Optional[str] = Field(None, description="Number format: 'compact' (1.2K, 3.4M), 'precise', 'percentage', 'currency'")
+    currency: Optional[str] = Field(None, description="Currency code: 'USD', 'EUR', 'GBP', 'INR'")
+    decimal_places: Optional[int] = Field(None, description="Decimal precision: 0-8")
+    
+    # Date formatting
+    date_format: Optional[str] = Field(None, description="Date format: 'short', 'medium', 'long', 'relative', custom strftime")
+    
+    # Legend configuration
+    legend: Optional[Dict[str, Any]] = Field(None, description="Legend config: {position: 'top'|'bottom'|'left'|'right'|'none', alignment}")
+    
+    # Annotations
+    annotations: Optional[List[Dict[str, Any]]] = Field(None, description="Annotations: [{type: 'line'|'area'|'text', x, y, label, color}]")
+    reference_lines: Optional[List[Dict[str, Any]]] = Field(None, description="Reference lines: [{axis: 'x'|'y', value, label, color, style: 'solid'|'dashed'}]")
+    
+    # Interaction
+    tooltips: Optional[Dict[str, Any]] = Field(None, description="Tooltip config: {enabled, format, fields}")
+    drill_down: Optional[Dict[str, Any]] = Field(None, description="Drill-down config: {enabled, levels, target_query}")
+    cross_filter: Optional[bool] = Field(None, description="Enable cross-filtering with other charts")
+    
+    # Layout
+    chart_height: Optional[int] = Field(None, description="Chart height in pixels")
+    chart_width: Optional[int] = Field(None, description="Chart width in pixels or percentage")
+    responsive: Optional[bool] = Field(True, description="Auto-resize chart to container")
+    
+    # Chart-specific options
+    bar_spacing: Optional[float] = Field(None, description="Bar chart spacing: 0-1")
+    line_style: Optional[str] = Field(None, description="Line style: 'solid', 'dashed', 'dotted'")
+    point_size: Optional[int] = Field(None, description="Point size for scatter/line charts")
+    
+    class Config:
+        extra = "allow"  # Allow additional custom options
+
+
 class Visualization(BaseModel):
     """
     Dynamic, AI-centric visualization specification.
@@ -180,7 +460,7 @@ class Visualization(BaseModel):
     Includes intelligent aggregators, filters, and controls.
     """
     chart_id: str = Field(..., description="Unique identifier for this visualization")
-    type: str = Field(..., description="Chart type: table, bar, line, pie, area, scatter, heatmap, multi_viz")
+    type: str = Field(..., description="Chart type: table, bar, line, pie, area, scatter, heatmap, treemap, funnel, waterfall, gantt, sankey, boxplot, multi_viz")
     title: str = Field(..., description="Display title for the visualization")
     subtitle: Optional[str] = Field(None, description="Optional subtitle")
     description: Optional[str] = Field(None, description="Chart description/explanation")
@@ -194,6 +474,9 @@ class Visualization(BaseModel):
     
     # AI-generated aggregation suggestions for each chart type
     aggregators: Optional[Dict[str, Any]] = Field(None, description="Dynamic aggregators for bar/line/pie charts with controls and defaults")
+    
+    # Advanced customization (NEW)
+    customization: Optional[ChartCustomization] = Field(None, description="Advanced chart customization options")
     
     # Presentation options
     show_raw_data: Optional[bool] = Field(True, description="Show raw data table option")
@@ -302,11 +585,16 @@ class ResponseWrapper(BaseModel):
     timestamp: Optional[int] = None
     original_query: Optional[str] = None
     intent: Optional[Dict[str, Any]] = None  # Add intent classification result
+    session_id: Optional[str] = None  # Optional session identifier for client sync
+    message_id: Optional[str] = None  # Message ID for progress tracking
 
 
 class SessionSummary(BaseModel):
     session_id: str
     created_at: datetime
+    last_updated: Optional[datetime] = None  # When session was last updated
+    title: Optional[str] = None  # First message or session title
+    message_count: Optional[int] = None  # Number of messages in session
 
 
 class MessageSchema(BaseModel):
@@ -320,17 +608,27 @@ class MessageSchema(BaseModel):
     - Follow-up suggestions
     - Routing and debug information
     """
+    id: Optional[str] = None  # Message ID
     response_type: str  # 'user_query' or 'assistant_response'
     query: Optional[str] = None  # The user's query (for user_query messages)
     queried_at: Optional[datetime] = None  # When the query was received
     responded_at: Optional[datetime] = None  # When the response was sent (for assistant messages)
     response: Dict[str, Any]  # Full response object (LamaResponse dict for assistant messages, {} for user messages)
     created_at: datetime
+    
+    class Config:
+        # Allow arbitrary types and ensure we serialize dicts properly
+        arbitrary_types_allowed = True
+        json_encoders = {
+            datetime: lambda v: v.isoformat()
+        }
 
 
 class SessionHistoryResponse(BaseModel):
     session_id: str
     messages: List[MessageSchema]
+    # Optional list of files associated with this session (for UI chips, etc.)
+    files: Optional[List["UploadedFileSchema"]] = None
 
 
 class SessionsResponse(BaseModel):
@@ -341,6 +639,15 @@ class SessionsResponse(BaseModel):
 class NewSessionResponse(BaseModel):
     success: bool
     session_id: str
+
+
+class UploadedFileSchema(BaseModel):
+    """Lightweight schema for uploaded files returned with session history."""
+    id: str
+    filename: str
+    filetype: str
+    size: int
+    upload_time: datetime
 
 
 class HealthResponse(BaseModel):
@@ -489,6 +796,9 @@ class DebugInfo(BaseModel):
     normalized_user_request: Optional[str] = None
     requires_date: Optional[bool] = None
     complexity: Optional[str] = None
+    sql_executed: Optional[str] = None
+    row_count: Optional[int] = None
+    columns: Optional[List[str]] = None
     
     class Config:
         extra = "allow"
@@ -516,7 +826,21 @@ class LamaResponse(BaseModel):
     visualizations: Optional[Visualization] = Field(None, description="Visualization configuration (single multi_viz by default)")
     routing: RoutingInfo = Field(..., description="Routing and intent info")
     followups: List[FollowUpSuggestion] = Field(default_factory=list, description="Follow-up suggestions")
+    variations: Optional[List[str]] = Field(None, description="Alternative response variations (ChatGPT-style)")
     debug: Optional[DebugInfo] = Field(None, description="Debug information")
+
+
+# ============================================================================
+# Feedback Schema
+# ============================================================================
+
+class FeedbackRequest(BaseModel):
+    """Request body for submitting message feedback."""
+    feedback: Optional[Literal['LIKED', 'DISLIKED']] = Field(
+        None, 
+        description="Feedback value: 'LIKED', 'DISLIKED', or null to clear feedback"
+    )
+
 
 # Rebuild ResponseWrapper model to resolve forward reference to LamaResponse
 ResponseWrapper.model_rebuild()

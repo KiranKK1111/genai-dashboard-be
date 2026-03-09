@@ -1,11 +1,9 @@
 """Main query orchestrator - unified entry point for all query types.
 
 This module provides handle_dynamic_query() which:
-1. Uses DecisionEngine to route (SQL / FILES / CHAT)
-2. Processes the appropriate service
-3. Returns consistent ResponseWrapper
-
-Works with the new modular architecture.
+1. Uses SemanticIntentRouter to route (RUN_SQL / ANALYZE_FILE / CHAT / MIXED)
+2. Executes the appropriate handler
+3. Returns a consistent ResponseWrapper
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ from .query_handler import (
     build_file_lookup_response,
     build_standard_response,
 )
-from .decision_engine import create_decision_engine
+from .semantic_routing_integration import SemanticRoutingIntegration
 
 
 async def handle_dynamic_query(
@@ -53,64 +51,116 @@ async def handle_dynamic_query(
         ResponseWrapper with appropriate response type
     """
     
-    # Step 1: Decide what to do
-    decision_engine = await create_decision_engine()
-    
-    files_uploaded = uploaded_files is not None and len(uploaded_files) > 0
-    database_available = db is not None
-    
-    decision = await decision_engine.decide(
-        user_message=user_message,
-        files_uploaded=files_uploaded,
-        database_available=database_available,
+    files_uploaded = bool(uploaded_files)
+
+    # Step 1: Semantic routing decision (single source of truth)
+    routing_integration = SemanticRoutingIntegration(db)
+    router_decision = await routing_integration.make_routing_decision(
+        user_query=user_message,
+        session_id=session_id,
+        user_id=user_id,
+        current_request_has_files=files_uploaded,
     )
-    
-    print(f"[DECISION] Action: {decision.action.value}, Confidence: {decision.confidence:.0%}")
-    print(f"           Reasoning: {decision.reasoning}")
-    
-    # Step 2: Route to appropriate handler
+
+    print(
+        f"[ROUTER] Tool: {router_decision.tool.value}, Confidence: {router_decision.confidence:.0%}"
+    )
+    print(f"         Reasoning: {router_decision.reasoning}")
+
+    # Clarification gating
+    if router_decision.needs_clarification:
+        first_q = router_decision.clarification_questions[0] if router_decision.clarification_questions else None
+        clarification_text = getattr(first_q, "question", None) if first_q else None
+        clarification_text = clarification_text or "I need more information to proceed."
+
+        clarification_response = schemas.StandardResponse(
+            type="clarification",
+            intent=user_message,
+            confidence=router_decision.confidence,
+            message=clarification_text,
+            needs_clarification=True,
+            clarification_options=None,
+            metadata={
+                "type": "clarification_request",
+                "router": router_decision.model_dump(mode="json"),
+            },
+        )
+
+        wrapper = schemas.ResponseWrapper(
+            success=True,
+            response=clarification_response,
+            timestamp=current_timestamp(),
+            original_query=user_message,
+        )
+        wrapper.intent = {
+            "domain": router_decision.tool.value,
+            "confidence": router_decision.confidence,
+            "reasoning": router_decision.reasoning,
+            "action": router_decision.tool.value,
+        }
+        return wrapper
+
+    # Step 2: Execute based on routing decision
     try:
-        if decision.action.value == "RUN_SQL":
+        if router_decision.tool == schemas.Tool.MIXED:
+            from .agentic_query_handler import create_agentic_handler
+
+            handler = await create_agentic_handler(db)
+            wrapper = await handler.handle_query(
+                user_query=user_message,
+                user_id=user_id,
+                session_id=session_id,
+                conversation_history=conversation_history,
+                uploaded_files=uploaded_files or [],
+            )
+
+        elif router_decision.tool == schemas.Tool.RUN_SQL:
             # Route to data query handler
-            response = await build_data_query_response(
+            wrapper = await build_data_query_response(
                 db=db,
                 user_id=user_id,
                 session_id=session_id,
                 query=user_message,
                 conversation_history=conversation_history,
             )
-            return response
-        
-        elif decision.action.value == "ANALYZE_FILES":
+
+        elif router_decision.tool == schemas.Tool.ANALYZE_FILE:
             # Route to file query handler
             if uploaded_files:
-                response = await build_file_query_response(
+                wrapper = await build_file_query_response(
                     db=db,
                     user_id=user_id,
                     session_id=session_id,
                     query=user_message,
                     files=uploaded_files,
+                    conversation_history=conversation_history,
                 )
-                return response
             else:
                 # No files, fall back to file lookup
-                response = await build_file_lookup_response(
+                wrapper = await build_file_lookup_response(
                     db=db,
                     user_id=user_id,
                     session_id=session_id,
                     query=user_message,
+                    conversation_history=conversation_history,
                 )
-                return response
-        
-        else:  # CHAT or uncertainty-driven clarification (needs_clarification)
+
+        else:  # CHAT
             # Route to standard/chat response handler or clarification flow
-            response = await build_standard_response(
+            wrapper = await build_standard_response(
                 db=db,
                 user_id=user_id,
                 session_id=session_id,
                 query=user_message,
             )
-            return response
+
+        wrapper.intent = {
+            "domain": router_decision.tool.value,
+            "confidence": router_decision.confidence,
+            "reasoning": router_decision.reasoning,
+            "action": router_decision.tool.value,
+        }
+        return wrapper
     
     except Exception as e:
         # Handle errors gracefully

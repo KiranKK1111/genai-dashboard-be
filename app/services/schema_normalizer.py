@@ -2,35 +2,38 @@
 Schema Normalizer - Maps domain concepts to database tables/columns.
 
 This service:
-1. Maintains canonical domain models (Transaction, Customer, Order, etc.)
-2. Maps DB-specific table/column names to canonical concepts
-3. Generates candidates for semantic queries
-4. Provides scoring for candidate ranking
+1. Maintains high-level domain entity types (for classification only)
+2. Uses LLM-based semantic matching for table/column discovery
+3. Provides generic heuristics as a fallback
+4. Relies on hybrid_matcher's LLM scoring for semantic understanding
 
 Makes the system database-agnostic by decoupling domain logic from DB schema.
+NO HARDCODED SYNONYMS - all semantic understanding comes from LLM.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass
 from enum import Enum
 
+from ..llm import call_llm
+
 logger = logging.getLogger(__name__)
 
 
 class DomainEntity(Enum):
-    """High-level domain entities the system understands."""
-    TRANSACTION = "transaction"
-    CUSTOMER = "customer"
+    """High-level domain entities the system understands (classification only)."""
+    RECORD = "record"
+    USER = "user"
+    ACCOUNT = "account"
     ORDER = "order"
     PRODUCT = "product"
-    MERCHANT = "merchant"
-    ACCOUNT = "account"
     INVOICE = "invoice"
     PAYMENT = "payment"
-    USER = "user"
+    DOCUMENT = "document"
     LEDGER = "ledger"
     EVENT = "event"
     AUDIT = "audit"
@@ -38,167 +41,87 @@ class DomainEntity(Enum):
 
 @dataclass
 class ConceptMapping:
-    """Maps a domain concept to possible DB table/column names."""
+    """Maps a domain concept - now LLM-driven instead of hardcoded."""
     entity: DomainEntity
-    instance_synonyms: List[str]  # e.g., ["transaction", "txn", "trans", "payment"]
-    id_synonyms: List[str]  # e.g., ["transaction_id", "txn_id", "id", "ref_no"]
-    timestamp_synonyms: List[str]  # e.g., ["created_at", "transaction_time", "posted_at"]
-    amount_synonyms: List[str]  # e.g., ["amount", "value", "total", "debit", "credit"]
-    signature_columns: List[str]  # Columns that identify this entity
+    # Removed hardcoded synonyms - LLM handles semantic matching
 
 
 class SchemaNormalizer:
     """
     Maps actual database schema to canonical domain concepts.
     
-    Uses:
-    - Concept mappings (synonyms for tables, columns, etc.)
-    - Heuristics for table/column identification
-    - LLM scoring in hybrid matcher
+    Uses LLM-based semantic matching instead of hardcoded synonyms.
+    All semantic understanding is delegated to the LLM.
     """
     
     def __init__(self):
-        # Define canonical mappings for common domain entities
+        # No hardcoded mappings - use LLM for semantic matching
         self.concepts: Dict[DomainEntity, ConceptMapping] = {
-            DomainEntity.TRANSACTION: ConceptMapping(
-                entity=DomainEntity.TRANSACTION,
-                instance_synonyms=[
-                    "transaction", "txn", "transact", "transfer", "payment",
-                    "posting", "ledger_entry", "entry", "trade", "deal"
-                ],
-                id_synonyms=[
-                    "transaction_id", "txn_id", "trans_id", "id", "ref_no",
-                    "reference_id", "txn_ref", "rrn", "utr", "trace_no"
-                ],
-                timestamp_synonyms=[
-                    "created_at", "transaction_time", "posted_at", "value_date",
-                    "transaction_date", "txn_date", "settled_at", "dated"
-                ],
-                amount_synonyms=[
-                    "amount", "value", "total", "debit", "credit", "sum",
-                    "transaction_amount", "txn_amount", "price", "cost"
-                ],
-                signature_columns=[
-                    "amount", "transaction_id", "customer_id", "merchant_id",
-                    "account_id", "timestamp", "status"
-                ]
-            ),
-            DomainEntity.CUSTOMER: ConceptMapping(
-                entity=DomainEntity.CUSTOMER,
-                instance_synonyms=[
-                    "customer", "cust", "client", "account_holder",
-                    "user", "buyer", "party", "counterparty"
-                ],
-                id_synonyms=[
-                    "customer_id", "cust_id", "customer_code", "cust_code",
-                    "account_id", "account_number", "id"
-                ],
-                timestamp_synonyms=[
-                    "created_at", "onboarded_at", "joined_date", "start_date"
-                ],
-                amount_synonyms=[],
-                signature_columns=[
-                    "customer_id", "customer_code", "customer_name", "account_number"
-                ]
-            ),
-            DomainEntity.ORDER: ConceptMapping(
-                entity=DomainEntity.ORDER,
-                instance_synonyms=[
-                    "order", "purchase_order", "po", "sale", "sales_order"
-                ],
-                id_synonyms=[
-                    "order_id", "order_number", "order_num", "id",
-                    "purchase_order_id", "po_number"
-                ],
-                timestamp_synonyms=[
-                    "created_at", "order_date", "placed_at", "shipped_at"
-                ],
-                amount_synonyms=[
-                    "amount", "total", "price", "cost", "order_amount"
-                ],
-                signature_columns=[
-                    "order_id", "customer_id", "order_date", "status", "amount"
-                ]
-            ),
-            DomainEntity.MERCHANT: ConceptMapping(
-                entity=DomainEntity.MERCHANT,
-                instance_synonyms=[
-                    "merchant", "vendor", "seller", "supplier",
-                    "store", "retailer", "business"
-                ],
-                id_synonyms=[
-                    "merchant_id", "vendor_id", "merchant_code",
-                    "merchant_num", "id"
-                ],
-                timestamp_synonyms=[
-                    "created_at", "onboarded_at", "joined_date"
-                ],
-                amount_synonyms=[],
-                signature_columns=[
-                    "merchant_id", "merchant_name", "merchant_code", "category"
-                ]
-            ),
-            DomainEntity.ACCOUNT: ConceptMapping(
-                entity=DomainEntity.ACCOUNT,
-                instance_synonyms=[
-                    "account", "acct", "bank_account", "wallet",
-                    "fund", "ledger"
-                ],
-                id_synonyms=[
-                    "account_id", "acct_id", "account_number", "acct_number",
-                    "iban", "swift", "id"
-                ],
-                timestamp_synonyms=[
-                    "created_at", "opened_at", "closed_at"
-                ],
-                amount_synonyms=[
-                    "balance", "amount", "available_balance", "ledger_balance"
-                ],
-                signature_columns=[
-                    "account_id", "account_number", "account_type", "balance"
-                ]
-            ),
-            DomainEntity.PAYMENT: ConceptMapping(
-                entity=DomainEntity.PAYMENT,
-                instance_synonyms=[
-                    "payment", "pay", "disbursement", "settlement",
-                    "remittance", "transfer"
-                ],
-                id_synonyms=[
-                    "payment_id", "payment_number", "pay_id", "id",
-                    "settlement_id"
-                ],
-                timestamp_synonyms=[
-                    "created_at", "payment_date", "paid_at", "processed_at"
-                ],
-                amount_synonyms=[
-                    "amount", "payment_amount", "value", "total"
-                ],
-                signature_columns=[
-                    "payment_id", "payment_amount", "status", "created_at"
-                ]
-            ),
+            entity: ConceptMapping(entity=entity)
+            for entity in DomainEntity
         }
     
     def get_synonyms_for_entity(self, entity: DomainEntity) -> Dict[str, List[str]]:
-        """Get all synonyms for a domain entity."""
-        mapping = self.concepts.get(entity)
-        if not mapping:
-            return {}
-        
+        """Get synonyms for an entity - now returns empty (LLM handles semantics)."""
         return {
-            "instance": mapping.instance_synonyms,
-            "id": mapping.id_synonyms,
-            "timestamp": mapping.timestamp_synonyms,
-            "amount": mapping.amount_synonyms,
+            "instance": [],
+            "id": [],
+            "timestamp": [],
+            "amount": [],
         }
     
-    def guess_entity_from_term(self, term: str) -> Optional[DomainEntity]:
-        """Guess which domain entity a user term refers to."""
+    async def guess_entity_from_term_llm(self, term: str, available_tables: List[str]) -> Optional[DomainEntity]:
+        """Use LLM to guess which domain entity a user term refers to."""
         term_lower = term.lower().strip()
         
-        for entity, mapping in self.concepts.items():
-            if term_lower in mapping.instance_synonyms:
+        # Direct match with entity names
+        for entity in DomainEntity:
+            if entity.value.lower() == term_lower:
+                return entity
+        
+        # Use LLM for semantic matching
+        entity_names = [e.value for e in DomainEntity]
+        prompt = f"""Given the user term "{term}", determine which domain entity it refers to.
+
+Available domain entities: {', '.join(entity_names)}
+Available database tables: {', '.join(available_tables[:20])}
+
+Rules:
+- Match semantically based on the available domain entities and database tables
+- If no clear match, return "none"
+
+Return ONLY the entity name (lowercase) or "none". No explanation."""
+
+        try:
+            response = await call_llm([
+                {"role": "system", "content": "You are a semantic matching assistant. Return only the entity name."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=50, temperature=0.0)
+            
+            result = str(response).strip().lower()
+            
+            # Find matching entity
+            for entity in DomainEntity:
+                if entity.value.lower() == result:
+                    return entity
+        except Exception as e:
+            logger.warning(f"LLM entity matching failed for '{term}': {e}")
+        
+        return None
+    
+    def guess_entity_from_term(self, term: str) -> Optional[DomainEntity]:
+        """
+        Guess entity from term - sync fallback with direct matching only.
+        For semantic matching, use guess_entity_from_term_llm() async version.
+        """
+        term_lower = term.lower().strip()
+        
+        # Direct match only - no hardcoded synonyms
+        for entity in DomainEntity:
+            if entity.value.lower() == term_lower:
+                return entity
+            # Simple substring match
+            if entity.value.lower() in term_lower or term_lower in entity.value.lower():
                 return entity
         
         return None
@@ -209,52 +132,98 @@ class SchemaNormalizer:
         all_tables: Dict[str, any]
     ) -> List[Tuple[str, float]]:
         """
-        Find candidate tables for an entity.
+        Find candidate tables for an entity using generic heuristics.
+        
+        NO HARDCODED SYNONYMS - uses direct name matching only.
+        LLM scoring in hybrid_matcher handles semantic understanding.
         
         Returns:
             List of (table_name, confidence) tuples, sorted by confidence descending.
         """
-        if entity not in self.concepts:
-            return []
-        
-        mapping = self.concepts[entity]
+        entity_name = entity.value.lower()
         candidates: Dict[str, float] = {}
         
         for table_name in all_tables.keys():
             table_lower = table_name.lower()
             score = 0.0
             
-            # Check table name synonyms
-            for synonym in mapping.instance_synonyms:
-                if synonym in table_lower or table_lower in synonym:
-                    # Exact match in name gets higher score
-                    if table_lower == synonym:
-                        score = max(score, 1.0)
-                    # Substring match
-                    elif synonym in table_lower or table_lower.endswith(synonym):
-                        score = max(score, 0.8)
-                    # Partial match
-                    else:
-                        score = max(score, 0.5)
+            # Direct name matching (no synonyms)
+            if table_lower == entity_name:
+                score = max(score, 1.0)
+            elif entity_name in table_lower:
+                score = max(score, 0.8)
+            elif table_lower in entity_name:
+                score = max(score, 0.6)
+            # Plural/singular variations
+            elif table_lower == entity_name + "s" or table_lower + "s" == entity_name:
+                score = max(score, 0.9)
             
-            # Check signature columns presence (penalty/reward)
+            # Generic column-based scoring (no hardcoded signature columns)
             table_obj = all_tables.get(table_name)
             if table_obj and hasattr(table_obj, 'columns'):
-                col_names = set(table_obj.columns.keys())
-                matching_sig_cols = sum(
-                    1 for sig_col in mapping.signature_columns
-                    if any(sig_col in col_name.lower() for col_name in col_names)
-                )
+                col_names = [c.lower() for c in table_obj.columns.keys()]
                 
-                if matching_sig_cols > 0:
-                    sig_score = min(0.3, matching_sig_cols * 0.1)
-                    score += sig_score
+                # Check if entity name appears in column names (indicates relation)
+                entity_related_cols = sum(1 for c in col_names if entity_name in c)
+                if entity_related_cols > 0:
+                    score = max(score, 0.4 + min(0.2, entity_related_cols * 0.05))
             
             if score > 0:
                 candidates[table_name] = min(score, 1.0)
         
         # Return sorted by confidence descending
         return sorted(candidates.items(), key=lambda x: x[1], reverse=True)
+    
+    async def find_candidate_tables_llm(
+        self,
+        entity: DomainEntity,
+        all_tables: Dict[str, any]
+    ) -> List[Tuple[str, float]]:
+        """
+        Find candidate tables using LLM semantic matching.
+        
+        Use this for full semantic understanding when async is available.
+        """
+        entity_name = entity.value
+        table_names = list(all_tables.keys())[:30]  # Limit for prompt size
+        
+        prompt = f"""Given the domain entity "{entity_name}", find which database tables likely store this data.
+
+Available tables: {', '.join(table_names)}
+
+Rules:
+- Consider semantic relationships and synonyms naturally
+- Consider plural/singular variations
+- Return tables with confidence scores 0.0-1.0
+
+Return JSON array: [{{"table": "name", "score": 0.9}}, ...]
+Only return tables with score > 0.3. Return empty array [] if no matches."""
+
+        try:
+            response = await call_llm([
+                {"role": "system", "content": "You are a database schema analyzer. Return only valid JSON."},
+                {"role": "user", "content": prompt}
+            ], max_tokens=300, temperature=0.0)
+            
+            response_text = str(response).strip()
+            # Extract JSON from response
+            if "[" in response_text:
+                json_start = response_text.index("[")
+                json_end = response_text.rindex("]") + 1
+                json_text = response_text[json_start:json_end]
+                matches = json.loads(json_text)
+                
+                result = []
+                for match in matches:
+                    if match.get("table") in all_tables:
+                        result.append((match["table"], float(match.get("score", 0.5))))
+                
+                return sorted(result, key=lambda x: x[1], reverse=True)
+        except Exception as e:
+            logger.warning(f"LLM table matching failed for '{entity_name}': {e}")
+        
+        # Fallback to heuristic matching
+        return self.find_candidate_tables(entity, all_tables)
     
     def find_candidate_id_columns(
         self,
@@ -263,34 +232,36 @@ class SchemaNormalizer:
         column_names: Set[str]
     ) -> List[Tuple[str, float]]:
         """
-        Find candidate ID columns for an entity in a table.
+        Find candidate ID columns using generic heuristics.
+        
+        NO HARDCODED SYNONYMS - uses pattern matching only.
         
         Returns:
             List of (column_name, confidence) tuples.
         """
-        if entity not in self.concepts:
-            return []
-        
-        mapping = self.concepts[entity]
+        entity_name = entity.value.lower()
         candidates: Dict[str, float] = {}
         
         for column_name in column_names:
             col_lower = column_name.lower()
             score = 0.0
             
-            # Check ID synonyms
-            for id_syn in mapping.id_synonyms:
-                if id_syn in col_lower or col_lower in id_syn:
-                    if col_lower == id_syn:
-                        score = max(score, 1.0)
-                    elif id_syn in col_lower:
-                        score = max(score, 0.9)
-                    else:
-                        score = max(score, 0.6)
-            
-            # Primary key columns get bonus
-            if "id" in col_lower or "pk" in col_lower:
-                score = max(score, 0.7)
+            # Generic ID patterns (no hardcoded synonyms)
+            # Pattern: {entity}_id or {entity}id
+            if col_lower == f"{entity_name}_id" or col_lower == f"{entity_name}id":
+                score = max(score, 1.0)
+            # Pattern: id (standalone)
+            elif col_lower == "id":
+                score = max(score, 0.8)
+            # Pattern: contains entity name + id
+            elif entity_name in col_lower and "id" in col_lower:
+                score = max(score, 0.9)
+            # Generic ID patterns
+            elif col_lower.endswith("_id") or col_lower.endswith("id"):
+                score = max(score, 0.5)
+            # Code/number patterns
+            elif "code" in col_lower or "number" in col_lower or "num" in col_lower:
+                score = max(score, 0.4)
             
             if score > 0:
                 candidates[column_name] = score

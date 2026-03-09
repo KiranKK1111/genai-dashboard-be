@@ -2,7 +2,7 @@
 Value Grounding: Maps semantic filter values to actual database values.
 
 Handles:
-- Converting "credit" → actual card_type values in DB (CREDIT, Credit Card, CC, etc.)
+- Converting a user-provided value → actual enum/text values present in the DB
 - Probing database for distinct values
 - LLM-assisted fuzzy matching when needed
 """
@@ -18,20 +18,15 @@ logger = logging.getLogger(__name__)
 
 
 class ValueGrounder:
-    """Maps semantic values to actual database values dynamically."""
+    """Maps semantic values to actual database values dynamically.
     
-    # Common semantic→DB value mappings (fallbacks if DB probe fails)
-    FALLBACK_MAPPINGS = {
-        'credit': ['CREDIT', 'Credit', 'Credit Card', 'CC', '1'],
-        'debit': ['DEBIT', 'Debit', 'Debit Card', 'DC', '2'],
-        'active': ['ACTIVE', 'Active', 'A', '1', 'Y'],
-        'inactive': ['INACTIVE', 'Inactive', 'I', '0', 'N'],
-        'pending': ['PENDING', 'Pending', 'P', '0'],
-        'approved': ['APPROVED', 'Approved', 'A', '1', 'Y'],
-        'rejected': ['REJECTED', 'Rejected', 'R', '0', 'N'],
-        'yes': ['YES', 'Yes', 'Y', '1', 'true'],
-        'no': ['NO', 'No', 'N', '0', 'false'],
-    }
+    NO HARDCODED FALLBACK_MAPPINGS - all value matching is done via:
+    1. Database probing (get actual distinct values)
+    2. LLM semantic matching
+    3. Fuzzy string matching
+    """
+    
+    # No hardcoded mappings - rely on dynamic value discovery
     
     def __init__(self, db_connector: Optional[Any] = None):
         """
@@ -47,8 +42,8 @@ class ValueGrounder:
     
     async def ground_value(
         self,
-        column_path: str,  # e.g., "cards.card_type"
-        semantic_value: str,  # e.g., "credit"
+        column_path: str,  # e.g., "table.column"
+        semantic_value: str,  # e.g., "premium"
         schema: str = "genai",
     ) -> str:
         """
@@ -56,7 +51,7 @@ class ValueGrounder:
         
         Args:
             column_path: Table.column reference
-            semantic_value: Semantic value to ground (e.g., "credit")
+            semantic_value: Semantic value to ground (e.g., "premium")
             schema: Schema name
         
         Returns:
@@ -145,7 +140,7 @@ class ValueGrounder:
         4. Levenshtein distance (if similar)
         
         Args:
-            semantic_value: What user said (e.g., "credit")
+            semantic_value: What user said (e.g., "premium")
             actual_values: What's in the DB
         
         Returns:
@@ -179,25 +174,20 @@ class ValueGrounder:
     
     def _fallback_ground(self, semantic_value: str) -> str:
         """
-        Use fallback mappings when DB probe fails.
+        Fallback when DB probe fails - returns original value.
+        
+        NO HARDCODED MAPPINGS - relies on LLM matching in ground_value().
+        The original value is passed through and the SQL generator's
+        LLM will handle semantic matching with actual schema values.
         
         Args:
             semantic_value: Semantic value
         
         Returns:
-            First matching fallback value, or original if no match
+            Original value (no hardcoded transformations)
         """
-        semantic_lower = semantic_value.lower()
-        
-        if semantic_lower in self.FALLBACK_MAPPINGS:
-            return self.FALLBACK_MAPPINGS[semantic_lower][0]
-        
-        # Try substring match
-        for key, values in self.FALLBACK_MAPPINGS.items():
-            if key in semantic_lower or semantic_lower in key:
-                return values[0]
-        
-        # Return original
+        # No hardcoded fallback mappings - return original
+        # The LLM in SQL generation will handle semantic matching
         return semantic_value
 
 
@@ -227,8 +217,8 @@ class FilterValueMapper:
         grounded = []
         
         for cond in where_conditions:
-            column = cond.get('column', '')  # e.g., "cards.card_type"
-            value_hint = cond.get('value_hint', '')  # e.g., "credit"
+            column = cond.get('column', '')  # e.g., "table.column"
+            value_hint = cond.get('value_hint', '')  # e.g., "premium"
             
             if not column or not value_hint:
                 grounded.append(cond)

@@ -2,7 +2,7 @@
 Plan Validator: Enforces semantic coverage rules on generated query plans.
 
 Validates that:
-1. If query mentions modifiers (credit/debit/etc) and matching table is available, it must be included
+1. If query mentions modifiers and matching table is available, it must be included
 2. If plan includes a table, it must have appropriate filters or existence conditions
 3. Joins are properly structured and non-circular
 """
@@ -63,7 +63,7 @@ class PlanValidator:
                 col_lower = col.lower()
                 
                 # Extract meaningful keywords from column names
-                # E.g., "card_type" → "card", "txn_date" → "txn" or "transaction"
+                # E.g., "status_type" → "status", "event_date" → "event" or "date"
                 keywords = self._extract_keywords(col_lower)
                 
                 for keyword in keywords:
@@ -102,8 +102,8 @@ class PlanValidator:
     def _extract_keywords(self, column_name: str) -> List[str]:
         """
         Extract relevant keywords from column names.
-        E.g., "card_type" → ["card", "type"]
-             "txn_date" → ["txn", "transaction", "date"]
+           E.g., "status_type" → ["status", "type"]
+               "event_date" → ["event", "date"]
         """
         import re
         keywords = []
@@ -115,15 +115,9 @@ class PlanValidator:
         for part in parts:
             keywords.append(part)
             
-            # Add expansions for common abbreviations
-            if part == 'txn':
-                keywords.append('transaction')
-            elif part == 'cust':
-                keywords.append('customer')
-            elif part == 'acct':
-                keywords.append('account')
-            elif part == 'kyc':
-                keywords.append('kyc')
+            # Note: Common abbreviation expansion removed - LLM handles semantic understanding
+            # Abbreviations like 'txn', 'cust', 'acct' will be matched semantically
+            # through the table/column naming patterns in the schema
         
         return list(set(keywords))  # Remove duplicates
     

@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     embeddings_api: Optional[str] = Field(None, env="EMBEDDINGS_API")
     embeddings_token: Optional[str] = Field(None, env="EMBEDDINGS_TOKEN")
     embeddings_model: Optional[str] = Field(None, env="EMBEDDINGS_MODEL")
+    
+    # Embeddings - semantic search powered by sentence-transformers
+    embedding_model: str = Field("all-MiniLM-L6-v2", env="EMBEDDING_MODEL")
+    embedding_model_cache_dir: Optional[str] = Field(None, env="EMBEDDING_MODEL_CACHE_DIR")
+    embedding_dimensions: int = Field(384, env="EMBEDDING_DIMENSIONS")  # 384 for all-MiniLM-L6-v2, 1536 for OpenAI text-embedding-3-small
 
     # Server configuration
     host: str = Field("0.0.0.0", env="HOST")
@@ -108,6 +113,38 @@ class Settings(BaseSettings):
     )
     # Set to True to discover ALL tables in the database schema (ignores allowed_tables)
     discover_all_tables: bool = Field(False, env="DISCOVER_ALL_TABLES")
+    
+    # PHASE 1-5: Universal Schema Agnostic Feature Flags
+    # Enable/disable each phase of the schema discovery system independently
+    # Start with False (legacy behavior), incrementally enable for testing
+    
+    # PHASE 1: Schema Discovery Foundation
+    # Dynamically discover FK relationships, boolean columns, enum types
+    enable_schema_discovery_engine: bool = Field(False, env="ENABLE_SCHEMA_DISCOVERY_ENGINE")
+    schema_discovery_cache_ttl_seconds: int = Field(3600, env="SCHEMA_DISCOVERY_CACHE_TTL_SECONDS")
+    
+    # PHASE 2: Intent Classification
+    # Use LLM semantic analysis instead of hardcoded keyword checks
+    enable_semantic_intent_classifier: bool = Field(False, env="ENABLE_SEMANTIC_INTENT_CLASSIFIER")
+    intent_classification_confidence_threshold: float = Field(0.6, env="INTENT_CLASSIFICATION_CONFIDENCE_THRESHOLD")
+    
+    # PHASE 3: Universal Value Grounding
+    # Dynamically ground user values to DB enums instead of hardcoded fallback mappings
+    enable_universal_value_grounder: bool = Field(False, env="ENABLE_UNIVERSAL_VALUE_GROUNDER")
+    value_grounding_confidence_threshold: float = Field(0.7, env="VALUE_GROUNDING_CONFIDENCE_THRESHOLD")
+    
+    # PHASE 4: Remove FK Pattern Assumptions
+    # Use discovered FK relationships instead of hardcoded naming patterns
+    enable_discovered_fk_joins: bool = Field(False, env="ENABLE_DISCOVERED_FK_JOINS")
+    
+    # PHASE 5: Remove Boolean Pattern Matching
+    # Use actual column types instead of regex pattern matching
+    enable_discovered_boolean_columns: bool = Field(False, env="ENABLE_DISCOVERED_BOOLEAN_COLUMNS")
+    
+    # PHASE 6: Semantic Concept Mapping
+    # Map approval/status/verification concepts dynamically instead of hardcoded lists
+    enable_semantic_concept_mapper: bool = Field(False, env="ENABLE_SEMANTIC_CONCEPT_MAPPER")
+    semantic_concept_confidence_threshold: float = Field(0.7, env="SEMANTIC_CONCEPT_CONFIDENCE_THRESHOLD")
 
     @validator("cors_origins", pre=True)
     def parse_cors_origins(cls, v):  # type: ignore[override]

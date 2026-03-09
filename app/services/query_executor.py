@@ -47,9 +47,13 @@ async def get_record_count(session: AsyncSession, sql: str) -> int:
         # Strategy: Replace the SELECT clause with COUNT(*)
         import re
         
-        # Remove existing LIMIT/OFFSET clauses first
-        sql_no_limit = re.sub(r'\s+LIMIT\s+\d+\s*', ' ', sql, flags=re.IGNORECASE)
+        # First, strip trailing semicolon to avoid SQL syntax errors in subqueries
+        sql_cleaned = sql.rstrip(';').rstrip()
+        
+        # Remove existing LIMIT/OFFSET clauses
+        sql_no_limit = re.sub(r'\s+LIMIT\s+\d+\s*(?:;)?\s*', ' ', sql_cleaned, flags=re.IGNORECASE)
         sql_no_limit = re.sub(r'\s+OFFSET\s+\d+\s*', ' ', sql_no_limit, flags=re.IGNORECASE)
+        sql_no_limit = sql_no_limit.strip()
         
         # Find WHERE, GROUP BY, HAVING, ORDER BY positions
         where_match = re.search(r'\sWHERE\s', sql_no_limit, re.IGNORECASE)
@@ -57,7 +61,7 @@ async def get_record_count(session: AsyncSession, sql: str) -> int:
         
         # Strategy: If there's a GROUP BY, count groups. Otherwise count all records.
         if group_match:
-            # For GROUP BY queries, wrap in COUNT(DISTINCT ...)
+            # For GROUP BY queries, wrap in COUNT(*)
             count_sql = f"SELECT COUNT(*) as cnt FROM ({sql_no_limit}) as count_subquery"
         else:
             # Simple transformation: Replace SELECT ... FROM with SELECT COUNT(*) FROM
@@ -69,9 +73,6 @@ async def get_record_count(session: AsyncSession, sql: str) -> int:
             else:
                 # Fallback (shouldn't happen)
                 count_sql = f"SELECT COUNT(*) as cnt FROM ({sql_no_limit}) as subq"
-        
-        # Remove trailing semicolon if present
-        count_sql = count_sql.rstrip(';')
         
         print(f"[COUNT PROBE] Executing: {count_sql[:100]}...")
         

@@ -169,33 +169,35 @@ class AdaptiveSchemaAnalyzer:
         )
     
     async def _infer_from_samples(self, col_name: str, samples: List[Any]) -> tuple:
-        """Infer column purpose from sample values."""
+        """
+        Infer column purpose from sample values using pattern-based detection.
+        Uses column naming patterns and value characteristics instead of hardcoded lists.
+        """
         
         # Convert samples to strings for analysis
         sample_strs = [str(s).lower() for s in samples if s is not None]
         if not sample_strs:
             return None, 0.0
         
-        # Check for state abbreviations (AP, KA, TN, etc.)
-        state_abbreviations = {
-            "ap", "ka", "tn", "mh", "dl", "wb", "up", "gj", "rj", "hr", "cy", "hp", "jk", "od", "pb"
-        }
-        if any(s in state_abbreviations for s in sample_strs):
-            return "location", 0.8
+        col_lower = col_name.lower()
         
-        # Check for city names (common Indian cities)
-        cities = {
-            "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad", "pune", "chennai",
-            "kolkata", "ahmedabad", "jaipur", "lucknow", "indore", "thane", "nagpur"
-        }
-        if any(city in s for s in sample_strs for city in cities):
-            return "city", 0.8
+        # Infer location type from column name patterns (not hardcoded values)
+        if any(geo in col_lower for geo in ['state', 'province', 'region']):
+            # 2-3 char uppercase abbreviations suggest state/province codes
+            if any(2 <= len(s) <= 3 and s.isalpha() for s in sample_strs):
+                return "location", 0.8
         
-        # Check for phone-like patterns
-        if any(len(s) == 10 and s.isdigit() for s in sample_strs):
+        # Infer city type from column name patterns
+        if any(geo in col_lower for geo in ['city', 'town', 'municipality']):
+            # Values that are proper nouns (capitalized text, no digits) suggest city names
+            if any(s.replace(' ', '').isalpha() for s in sample_strs):
+                return "city", 0.7
+        
+        # Check for phone-like patterns (10+ digit numbers)
+        if any(len(s) >= 10 and s.replace('-', '').replace(' ', '').isdigit() for s in sample_strs):
             return "phone", 0.7
         
-        # Check for zip/postal codes
+        # Check for zip/postal codes (5-6 digit patterns)
         if any(5 <= len(s) <= 6 and s.isdigit() for s in sample_strs):
             return "pincode", 0.6
         

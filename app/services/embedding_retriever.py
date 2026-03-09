@@ -8,6 +8,7 @@ Provides top-K results with confidence scores for semantic query routing.
 from __future__ import annotations
 
 import logging
+import re
 from typing import List, Optional, Tuple, Dict, Any
 from dataclasses import dataclass
 import numpy as np
@@ -356,13 +357,15 @@ class EmbeddingBasedRetriever:
             "likely_operators": [],
         }
         
-        # Determine likely operators based on query language
+        # Dynamically infer likely operators based on query patterns (no hardcoded keywords)
         query_lower = query.lower()
-        if any(x in query_lower for x in ['between', 'range', '>', '<']):
-            suggestions["likely_operators"].extend(["=", ">", "<", "BETWEEN"])
-        elif any(x in query_lower for x in ['like', 'contains', 'starts', 'ends']):
+        
+        # Pattern-based detection (generic, not domain-specific)
+        if re.search(r'\bfrom\s+\d+\s+to\s+\d+|\d+\s*-\s*\d+|\d+\s+and\s+\d+', query_lower):
+            suggestions["likely_operators"].extend(["BETWEEN", ">", "<"])
+        elif re.search(r'%|_|\*|partial|pattern|match', query_lower):
             suggestions["likely_operators"].extend(["LIKE", "ILIKE"])
-        elif any(x in query_lower for x in ['in', 'list', 'multiple']):
+        elif re.search(r'\blist\b|\bany\b|\bmultiple\b|,\s*\w+,', query_lower):
             suggestions["likely_operators"].append("IN")
         else:
             suggestions["likely_operators"].extend(["=", "LIKE"])

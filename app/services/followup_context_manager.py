@@ -206,7 +206,7 @@ class FollowupContextManager:
                 sql=sql,
                 data=data,
                 metadata=metadata,
-                created_at=message.created_at if hasattr(message, 'created_at') else None,
+                created_at=message.updated_at if hasattr(message, 'updated_at') else None,
                 can_be_used_for_followup=True
             )
             

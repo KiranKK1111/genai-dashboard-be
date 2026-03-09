@@ -50,6 +50,7 @@ class QueryPlanValidator:
         self.schema = schema_catalog
         self.errors: List[str] = []
         self.warnings: List[str] = []
+        self._current_plan: Optional['QueryPlan'] = None  # Track current plan being validated
     
     async def validate(self, plan: QueryPlan) -> QueryPlan:
         """
@@ -63,6 +64,7 @@ class QueryPlanValidator:
         """
         self.errors = []
         self.warnings = []
+        self._current_plan = plan  # Store current plan for _get_primary_table
         
         if plan.intent != "data_query":
             return plan  # Only validate data queries
@@ -147,7 +149,7 @@ class QueryPlanValidator:
         if any(func in field.upper() for func in ["COUNT(", "SUM(", "AVG(", "MAX(", "MIN("]):
             return
         
-        # Allow aliases (e.g., "t.customer_id" or "customers.id")
+        # Allow aliases (e.g., "t.entity_id" or "table.id")
         # We'll do basic validation - more thorough validation would parse expressions
         if "(" in field and ")" in field:
             # Could be a function like DATE_TRUNC(...)
@@ -170,7 +172,7 @@ class QueryPlanValidator:
             table_name = cond.left.table or self._get_primary_table()
             await self._validate_column_exists(table_name, cond.left.column)
         elif isinstance(cond.left, str):
-            # String reference like "customer_id"
+            # String reference like "entity_id"
             # Try to find it in the primary table
             table_name = self._get_primary_table()
             await self._validate_column_exists(table_name, cond.left)
@@ -209,9 +211,11 @@ class QueryPlanValidator:
             await self._validate_subquery_in_condition(cond.condition)
     
     def _get_primary_table(self) -> str:
-        """Get the primary table (FROM clause)."""
-        # This is a simplification - in reality we'd track table context
-        return "transactions"  # Default, should be set by caller
+        """Get the primary table (FROM clause) from the current plan being validated."""
+        if self._current_plan and self._current_plan.from_:
+            return self._current_plan.from_.table
+        # Fallback to empty string if no plan context (should not happen in normal flow)
+        return ""
     
     def get_artifacts(self, plan: QueryPlan) -> QueryArtifacts:
         """Extract query artifacts from a validated plan."""
@@ -298,8 +302,8 @@ class JoinPathFinder:
     
     Usage:
         finder = JoinPathFinder(schema_catalog)
-        path = await finder.find_path("transactions", "customers")
-        # Returns: [("transactions", "customers", "fk_customer_id")]
+        path = await finder.find_path("table1", "table2")
+        # Returns: [("table1", "table2", "fk_table2_id")]
     """
     
     def __init__(self, schema_catalog: SchemaCatalog):

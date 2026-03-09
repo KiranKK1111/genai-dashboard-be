@@ -355,24 +355,24 @@ CHIT_CHAT: Casual conversation about personal status or interaction (with greeti
 
 DATA_RETRIEVAL: User wants to GET, FETCH, SHOW, LIST, DISPLAY data from database or find specific information
   KEY INDICATORS: "get", "show", "list", "display", "fetch", "retrieve", "what are", "what is the", "find", "give me", "[entity] id", or specific ID/value lookups
-  IMPORTANT: ANY query mentioning a database entity (transaction, customer, order, account) OR a specific ID/reference is DATA_RETRIEVAL
+    IMPORTANT: ANY query mentioning a database table/view name OR a specific ID/reference is DATA_RETRIEVAL
   Examples: 
-    - "get me all customers"
-    - "show transactions"
-    - "what is the transaction reference for transaction id 1353189" (SPECIFIC LOOKUP)
-    - "find the customer name for id 123"
-    - "what's the account balance for account 456"
+        - "get me all users"
+        - "show records"
+        - "what is the reference for record id 1353189" (SPECIFIC LOOKUP)
+        - "find the name for id 123"
+        - "what's the balance for account 456"
   If query mentions: getting/showing/listing/finding DATA from company database OR looking up specific record by ID → DATA_RETRIEVAL
   Return: DATA_RETRIEVAL
 
 DATA_ANALYSIS: User wants STATISTICS, COUNTS, AGGREGATES, TRENDS, SUMMARIES
   Keywords: "how many", "count", "sum", "average", "total", "statistics", "trends", "compare"
-  Examples: "how many customers", "what's the total sales", "average order value"
+    Examples: "how many records", "what's the total sales", "average value"
   Return: DATA_ANALYSIS
 
 DATA_MODIFICATION: User wants to CREATE, ADD, INSERT, UPDATE, DELETE database records
   Keywords: "add", "insert", "create", "update", "modify", "delete", "remove", "change"
-  Examples: "add new customer", "update the order", "delete this record"
+    Examples: "add new record", "update the order", "delete this record"
   Return: DATA_MODIFICATION
 
 FILE_PROCESSING: User wants to UPLOAD, PROCESS, ANALYZE files
@@ -401,7 +401,7 @@ GENERAL_QUESTION: Abstract knowledge questions NOT about database or company dat
 DECISION LOGIC (Apply in order):
 1. If ONLY greeting words (hi, hello, hey) → GREETING
 2. If asking about personal interaction (how are you, what's up) → CHIT_CHAT
-3. If mentions database entity (transaction, customer, order, account, employee, etc.) OR has specific ID/reference lookup → DATA_RETRIEVAL ⭐
+3. If mentions database table/view name OR has specific ID/reference lookup → DATA_RETRIEVAL ⭐
 4. If asking for counts/statistics/aggregates (how many, count, sum, average, etc.) → DATA_ANALYSIS
 5. If modifying/adding/deleting records → DATA_MODIFICATION
 6. If uploading/processing files → FILE_PROCESSING
@@ -467,7 +467,7 @@ Return ONLY the intent name (one word, ALL CAPS)."""
         
         # PRIORITY 2: Use LLM for fuzzy table extraction (even if exact matches found)
         # This helps find tables mentioned with different wording
-        # "customer with code X" should identify customers table
+        # "entity with code X" should identify the intended table
         if self.available_tables:
             try:
                 tables_list = ", ".join(sorted(list(self.available_tables)))
@@ -648,10 +648,8 @@ List which tables are likely being referenced. Return ONLY table names in a simp
         specific_lookup_patterns = [
             r'\bid\s+\d+',  # "id 123456"
             r'\bid\s*=\s*\d+',  # "id = 123456"
-            r'transaction\s+id\s+\d+',  # "transaction id 123456"
-            r'account\s+id\s+\d+',  # "account id 123456"
-            r'customer\s+id\s+\d+',  # "customer id 123456"
-            r'order\s+id\s+\d+',  # "order id 123456"
+            r'\b[a-z_]+\s+id\s+\d+',  # "<entity> id 123456"
+            r'\b[a-z_]+\s+id\s*=\s*\d+',  # "<entity> id = 123456"
             r'reference\s+\d+',  # "reference 123456"
             r'reference\s+for\s+\w+\s+', # "reference for transaction"
             r'find\s+\w+\s+(?:for|by|with)\s+', # "find X for/by/with Y"

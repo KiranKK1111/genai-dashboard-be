@@ -178,7 +178,11 @@ async def add_file(
     Returns:
         The persisted UploadedFile instance.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"[ADD_FILE] Processing file upload: {file.filename}, session: {session_id}")
     content_text, chunks, embeddings, file_size = await process_file_upload(file)
+    logger.info(f"[ADD_FILE] Extracted text length: {len(content_text)}, chunks: {len(chunks)}, embeddings: {len(embeddings)}, file size: {file_size} bytes")
     new_file = models.UploadedFile(
         session_id=session_id,
         filename=file.filename,
@@ -188,6 +192,7 @@ async def add_file(
     )
     db.add(new_file)
     await db.flush()
+    logger.info(f"[ADD_FILE] Uploaded file added to session and flushed: {new_file.id}")
     # Add chunks and embeddings
     for idx, (chunk, emb) in enumerate(zip(chunks, embeddings)):
         chunk_model = models.FileChunk(
@@ -198,6 +203,7 @@ async def add_file(
         )
         db.add(chunk_model)
     await db.commit()
+    logger.info(f"[ADD_FILE] File and chunks committed to database: {new_file.id}, filename {new_file.filename}")
     return new_file
 
 
@@ -224,11 +230,12 @@ async def retrieve_relevant_chunks(
     # Compute embedding for the query
     query_emb = (await llm.embed_text([query]))[0]
     # Fetch all chunks for this session
+    from sqlalchemy import select
     chunks = (
         await db.execute(
-            models.FileChunk.__table__.join(models.UploadedFile).select().where(
-                models.UploadedFile.session_id == session_id
-            )
+            select(models.FileChunk)
+            .join(models.UploadedFile)
+            .where(models.UploadedFile.session_id == session_id)
         )
     ).scalars().all()
     # Compute cosine similarity
@@ -245,4 +252,6 @@ async def retrieve_relevant_chunks(
         sim = float(np.dot(query_vec, chunk_vec) / denom)
         sims.append((chunk, sim))
     sims.sort(key=lambda x: x[1], reverse=True)
-    return [c for c, _ in sims[:top_k]]
+    
+    # Return just the chunks (without similarity scores)
+    return [chunk for chunk, score in sims[:top_k]]

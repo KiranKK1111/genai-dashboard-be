@@ -4,8 +4,8 @@ PRINCIPLE 3: Relationship-Aware Table Selection (Join Graph Search)
 Before LLM generates SQL, deterministically find correct join paths using FK metadata.
 
 Problem: Model chooses wrong linking table
-  "credit cards" → should join customers + cards on customer_id
-  BUT model might: join customers + transactions (because "credit" in transactions)
+  Example: User query mentions entity A with attribute from entity B
+  BUT model might: join entity A with entity C (due to semantic confusion)
 
 Solution: 
   1. Extract user's target entity (what they want)
@@ -152,7 +152,7 @@ class JoinGraphBuilder:
         Find all join paths that connect a set of required tables.
         
         Used when user mentions multiple entities:
-          "credit cards in Mumbai" → needs {cards, customers, branches}
+          "entity_a with filter_b" → needs {table_a, table_b, table_c}
           
         Args:
             required_tables: Tables that must be in result
@@ -193,18 +193,15 @@ class TableEntityClassifier:
         """
         self.schema = schema_grounding
         self.join_graph = join_graph
-        self.entity_keywords = {
-            "customers": ["customer", "clients", "users", "person", "cust"],
-            "accounts": ["account", "deposit", "savings", "checking"],
-            "cards": ["card", "credit card", "debit card", "visa", "mastercard"],
-            "transactions": ["transaction", "transfer", "payment", "charge", "activity"],
-            "branches": ["branch", "office", "location", "city"],
-            "loans": ["loan", "lending", "credit line"],
-        }
+        # NO HARDCODED ENTITY KEYWORDS - LLM determines semantic mappings
+        self._available_tables = list(schema_grounding.tables.keys()) if schema_grounding else []
 
     def extract_entities(self, user_query: str) -> Set[str]:
         """
         Extract tables mentioned or implied in user query.
+        
+        Uses direct word matching only - LLM handles semantic synonyms
+        during query plan generation.
         
         Args:
             user_query: User's natural language question
@@ -212,18 +209,22 @@ class TableEntityClassifier:
         Returns:
             Set of probable table names
         """
+        import re
         query_lower = user_query.lower()
+        query_words = set(re.findall(r'\b\w+\b', query_lower))
         found_tables = set()
 
-        for table_name, keywords in self.entity_keywords.items():
-            # Check if table exists
+        for table_name in self._available_tables:
+            # Check if table exists in schema
             if table_name not in self.schema.tables:
                 continue
-
-            for keyword in keywords:
-                if keyword in query_lower:
-                    found_tables.add(table_name)
-                    break
+            
+            table_lower = table_name.lower()
+            table_singular = table_lower.rstrip('s')
+            
+            # Direct word match only - no hardcoded synonyms
+            if table_lower in query_words or table_singular in query_words:
+                found_tables.add(table_name)
 
         logger.debug(f"[ENTITY_CLASSIFIER] Found tables: {found_tables}")
         return found_tables
@@ -235,11 +236,9 @@ class TableEntityClassifier:
         """
         Determine which table is the main SELECT target.
         
-        Rules (order matters):
-        1. If "customers" mentioned → customers is primary
-        2. If "cards" mentioned without customers → cards is primary
-        3. If "transactions" mentioned → transactions is primary
-        4. Otherwise: largest table
+        Dynamic priority based on schema discovery:
+        - Tables with the most foreign key references from other tables are likely primary
+        - LLM handles final prioritization based on user query context
         
         Args:
             entities: Set of extracted table names
@@ -247,12 +246,11 @@ class TableEntityClassifier:
         Returns:
             Primary table name or None
         """
-        priority = ["customers", "accounts", "cards", "transactions", "branches", "loans"]
-
-        for table in priority:
-            if table in entities:
-                logger.debug(f"[ENTITY_CLASSIFIER] Primary table: {table}")
-                return table
+        # Dynamic priority: use schema to determine which tables are "primary"
+        # Tables with the most foreign key references FROM other tables are likely primary
+        # For now, return first entity found (LLM handles prioritization)
+        if entities:
+            return next(iter(entities))
 
         return None
 
@@ -273,12 +271,12 @@ class RelationshipAwareTableSelector:
         
         Returns:
             {
-                "primary_table": "customers",
-                "related_tables": ["cards", "accounts"],
+                "primary_table": "<table_name>",
+                "related_tables": ["<related_table_1>", "<related_table_2>"],
                 "join_paths": [JoinPath objects],
-                "recommended_sql_from": "customers c",
+                "recommended_sql_from": "<table_name> <alias>",
                 "recommended_joins": [
-                    "LEFT JOIN cards ca ON c.customer_id = ca.customer_id",
+                    "LEFT JOIN <related_table> <alias> ON ...",
                     ...
                 ]
             }

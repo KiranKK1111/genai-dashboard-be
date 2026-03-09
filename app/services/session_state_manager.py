@@ -86,7 +86,7 @@ class QueryState:
     - "Now only for 2024"
     - "Break it month-wise"
     - "Show top 10"
-    - "Only KYC approved"
+    - "Only approved"
     
     WITHOUT this, the model will try to merge/hallucinate constraints.
     
@@ -95,7 +95,7 @@ class QueryState:
     
     # ===== WHAT WAS ASKED ABOUT =====
     domain: QueryDomain = QueryDomain.DATABASE
-    selected_entities: List[str] = field(default_factory=list)  # Tables/views used ("customers", "transactions")
+    selected_entities: List[str] = field(default_factory=list)  # Tables/views used
     
     # ===== HOW THEY CONNECT =====
     joins: List[JoinSpecification] = field(default_factory=list)
@@ -128,8 +128,9 @@ class QueryState:
     result_count: int = 0  # Rows returned
     
     def to_dict(self) -> Dict[str, Any]:
+        domain_val = self.domain.value if hasattr(self.domain, 'value') else str(self.domain)
         return {
-            "domain": self.domain.value,
+            "domain": domain_val,
             "selected_entities": self.selected_entities,
             "joins": [j.to_dict() for j in self.joins],
             "filters": [f.to_dict() for f in self.filters],
@@ -286,7 +287,8 @@ class QueryState:
         new_state.user_query = new_user_query
         new_state.confidence = 0.8  # Follow-ups have slightly lower initial confidence
         
-        logger.info(f"[DETERMINISTIC FOLLOW-UP] Type: {followup_type.value}, "
+        followup_type_val = followup_type.value if hasattr(followup_type, 'value') else str(followup_type)
+        logger.info(f"[DETERMINISTIC FOLLOW-UP] Type: {followup_type_val}, "
                    f"Schema preserved: {bool(new_state.last_result_schema)}, "
                    f"Entities: {new_state.selected_entities}")
         
@@ -331,9 +333,10 @@ class ToolCall:
         return int((end - self.start_time).total_seconds() * 1000)
     
     def to_dict(self) -> Dict[str, Any]:
+        tool_type_val = self.tool_type.value if hasattr(self.tool_type, 'value') else str(self.tool_type)
         return {
             "id": self.id,
-            "tool_type": self.tool_type.value,
+            "tool_type": tool_type_val,
             "input": self.input_json,
             "output": self.output_json,
             "success": self.success,
@@ -360,8 +363,201 @@ class FollowUpType(Enum):
 
 
 # ============================================================================
-# PART 4: Selective History Retrieval (Tiered)
+# PART 3A: Query Memory Store - Top-K Retrieval for Follow-ups
 # ============================================================================
+
+@dataclass
+class QueryExecution:
+    """
+    Single executed SQL query with full context for follow-ups.
+    
+    Enables top-K semantic retrieval to choose which previous query
+    a follow-up should anchor to.
+    """
+    
+    query_id: str  # Unique ID
+    user_query: str  # Original user question
+    generated_sql: str  # SQL that was executed
+    query_plan_json: Optional[Dict[str, Any]] = None  # Full query plan (plan-first system)
+    selected_tables: List[str] = field(default_factory=list)  # Tables in FROM/JOIN
+    filters_summary: str = ""  # Human-readable filter summary for embedding
+    joins_summary: str = ""  # Join structure summary
+    aggregation_summary: str = ""  # GROUP BY, aggregates summary
+    limit: Optional[int] = None
+    offset: Optional[int] = None
+    result_schema: Optional[List[str]] = None  # Column names from result
+    result_count: int = 0
+    result_sample: Optional[List[Dict]] = None  # First 20 rows
+    
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+    confidence: float = 0.85
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query_id": self.query_id,
+            "user_query": self.user_query,
+            "generated_sql": self.generated_sql,
+            "query_plan_json": self.query_plan_json,
+            "selected_tables": self.selected_tables,
+            "filters_summary": self.filters_summary,
+            "joins_summary": self.joins_summary,
+            "aggregation_summary": self.aggregation_summary,
+            "limit": self.limit,
+            "offset": self.offset,
+            "result_schema": self.result_schema,
+            "result_count": self.result_count,
+            "result_sample": self.result_sample,
+            "timestamp": self.timestamp.isoformat(),
+            "confidence": self.confidence,
+        }
+    
+    def get_query_signature(self) -> str:
+        """
+        Get a signature string for embedding-based retrieval.
+        
+        Used for semantic similarity matching to find related past queries.
+        Format: user_query + structural summary
+        """
+        parts = [
+            self.user_query,
+            f"tables: {' '.join(self.selected_tables)}",
+            self.filters_summary if self.filters_summary else "no filters",
+            self.joins_summary if self.joins_summary else "no joins",
+            self.aggregation_summary if self.aggregation_summary else "no aggregation",
+        ]
+        return " | ".join(parts)
+
+
+class QueryMemoryStore:
+    """
+    Stores multiple SQL query executions for top-K follow-up anchor selection.
+    
+    Enables deterministic follow-ups by finding related past queries
+    and allowing users to clarify which query to modify.
+    """
+    
+    def __init__(self, max_queries: int = 50):
+        self.queries: List[QueryExecution] = []
+        self.max_queries = max_queries
+    
+    def add_execution(self, execution: QueryExecution) -> None:
+        """Add a new query execution to memory."""
+        self.queries.append(execution)
+        
+        # Trim if exceeds max (keep most recent)
+        if len(self.queries) > self.max_queries:
+            self.queries = self.queries[-self.max_queries:]
+        
+        logger.debug(f"[QUERY MEMORY] Stored query {execution.query_id}, total: {len(self.queries)}")
+    
+    def get_top_k_similar(
+        self,
+        followup_query: str,
+        k: int = 3,
+        recency_weight: float = 0.2,
+        max_age_seconds: int = 3600,
+    ) -> List[Tuple[QueryExecution, float]]:
+        """
+        Retrieve top-K most relevant past queries for a follow-up.
+        
+        Uses semantic similarity + recency bias + entity overlap.
+        
+        Args:
+            followup_query: The follow-up query
+            k: Number of results to return
+            recency_weight: How much to weight recent queries (0.0-1.0)
+            max_age_seconds: Don't return queries older than this
+            
+        Returns:
+            List of (QueryExecution, similarity_score) tuples, sorted by score descending
+        """
+        from datetime import timedelta
+        
+        now = datetime.utcnow()
+        cutoff_time = now - timedelta(seconds=max_age_seconds)
+        
+        # Filter to recent queries only
+        recent_queries = [
+            q for q in self.queries
+            if q.timestamp > cutoff_time
+        ]
+        
+        if not recent_queries:
+            return []
+        
+        scores = []
+        
+        for query in recent_queries:
+            # Basic semantic similarity (word overlap for now)
+            # TODO: Use embeddings when available
+            followup_words = set(followup_query.lower().split())
+            signature_words = set(query.get_query_signature().lower().split())
+            
+            # Jaccard similarity
+            intersection = len(followup_words & signature_words)
+            union = len(followup_words | signature_words)
+            semantic_sim = intersection / union if union > 0 else 0.0
+            
+            # Recency bonus (more recent = higher score)
+            age_seconds = (now - query.timestamp).total_seconds()
+            recency = 1.0 - (age_seconds / max_age_seconds)
+            recency_bonus = recency_weight * recency
+            
+            # Entity overlap bonus
+            entity_bonus = 0.0
+            followup_entities = followup_query.lower().split()[:5]  # First 5 words as potential entities
+            for entity in followup_entities:
+                if entity in query.get_query_signature().lower():
+                    entity_bonus += 0.1
+            entity_bonus = min(entity_bonus, 0.3)  # Cap at 0.3
+            
+            # Combined score
+            total_score = semantic_sim + recency_bonus + entity_bonus
+            scores.append((query, total_score))
+        
+        # Sort by score descending
+        scores.sort(key=lambda x: x[1], reverse=True)
+        
+        logger.debug(
+            f"[QUERY MEMORY] Retrieved top {min(k, len(scores))} similar queries for follow-up"
+        )
+        
+        return scores[:k]
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Export memory store for persistence."""
+        return {
+            "queries": [q.to_dict() for q in self.queries[-20:]],  # Keep last 20 in export
+            "total_stored": len(self.queries),
+        }
+    
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> QueryMemoryStore:
+        """Reconstruct from persisted data."""
+        store = QueryMemoryStore()
+        for q_data in data.get("queries", []):
+            # Reconstruct QueryExecution
+            exec = QueryExecution(
+                query_id=q_data.get("query_id"),
+                user_query=q_data.get("user_query", ""),
+                generated_sql=q_data.get("generated_sql", ""),
+                query_plan_json=q_data.get("query_plan_json"),
+                selected_tables=q_data.get("selected_tables", []),
+                filters_summary=q_data.get("filters_summary", ""),
+                joins_summary=q_data.get("joins_summary", ""),
+                aggregation_summary=q_data.get("aggregation_summary", ""),
+                limit=q_data.get("limit"),
+                offset=q_data.get("offset"),
+                result_schema=q_data.get("result_schema"),
+                result_count=q_data.get("result_count", 0),
+                result_sample=q_data.get("result_sample"),
+                timestamp=datetime.fromisoformat(q_data.get("timestamp", datetime.utcnow().isoformat())),
+                confidence=q_data.get("confidence", 0.85),
+            )
+            store.add_execution(exec)
+        return store
+
+
 
 @dataclass
 class SelectiveHistory:
@@ -395,13 +591,20 @@ class SelectiveHistory:
         # Last query state
         if self.last_query_state:
             context_parts.append("\n[LAST QUERY STATE]")
-            context_parts.append("Domain: " + self.last_query_state.domain.value)
+            domain_val = self.last_query_state.domain.value if hasattr(self.last_query_state.domain, 'value') else str(self.last_query_state.domain)
+            context_parts.append("Domain: " + domain_val)
             context_parts.append("Tables: " + ", ".join(self.last_query_state.selected_entities))
             if self.last_query_state.filters:
                 context_parts.append("Previous filters:")
                 for f in self.last_query_state.filters:
                     context_parts.append(f"  - {f.column} {f.operator} {f.value}")
             context_parts.append("Previous query: " + self.last_query_state.user_query)
+            
+            # CRITICAL FOR FOLLOW-UPS: Include the generated SQL so follow-up queries can reference it
+            if self.last_query_state.generated_sql:
+                context_parts.append(f"[SQL] {self.last_query_state.generated_sql}")
+                if self.last_query_state.result_count > 0:
+                    context_parts.append(f"[Results] {self.last_query_state.result_count} rows returned")
         
         # Recent messages
         if self.recent_messages:
@@ -413,7 +616,8 @@ class SelectiveHistory:
         if self.tool_calls:
             context_parts.append("\n[RECENT TOOL CALLS]")
             for tc in self.tool_calls[-3:]:  # Last 3 tool calls
-                context_parts.append(f"- {tc.tool_type.value}: {tc.input_json.get('query', tc.input_json)[:100]}")
+                tool_type_val = tc.tool_type.value if hasattr(tc.tool_type, 'value') else str(tc.tool_type)
+                context_parts.append(f"- {tool_type_val}: {tc.input_json.get('query', tc.input_json)[:100]}")
         
         # Semantic results
         if self.semantic_results:
@@ -499,6 +703,12 @@ class SessionStateManager:
         self.last_query_state: Optional[QueryState] = None
         self.tool_calls: List[ToolCall] = []
         self.messages: List[Dict[str, str]] = []
+        
+        # NEW: Query memory store for follow-up anchor selection
+        self.query_memory: QueryMemoryStore = QueryMemoryStore(max_queries=50)
+        
+        # NEW: Store RAG-based followup context so query_handler can use it
+        self.followup_context_from_rag: Optional[Any] = None  # Stores FollowUpContext from RAG
     
     def record_query_execution(
         self,
@@ -584,6 +794,44 @@ class SessionStateManager:
             "content": content,
             "timestamp": datetime.utcnow().isoformat(),
         })
+    
+    def add_sql_conversation_entry(self, user_query: str, generated_sql: str, result_count: int, success: bool) -> None:
+        """Add SQL conversation entry for ChatGPT-level follow-up detection.
+        
+        This creates a focused SQL conversation history that enables dynamic follow-up detection
+        without storing full response data.
+        """
+        # Store in messages with structured format for easy parsing
+        self.add_message("user", user_query)
+        
+        if generated_sql and success:
+            # Store SQL context in a structured way
+            sql_context = f"SQL: {generated_sql}"
+            if result_count > 0:
+                sql_context += f" | Results: {result_count} rows"
+            self.add_message("assistant", sql_context)
+    
+    def get_sql_conversation_history(self, max_entries: int = 5) -> str:
+        """Get clean SQL conversation history for follow-up detection.
+        
+        Returns a simple USER:/SQL: format that follow-up analyzers can parse.
+        This is the ChatGPT-level conversation memory for database queries.
+        """
+        if not self.messages:
+            return ""
+        
+        # Get recent messages and format for follow-up detection
+        recent_messages = self.messages[-max_entries*2:] if self.messages else []
+        history_lines = []
+        
+        for msg in recent_messages:
+            if msg["role"] == "user":
+                history_lines.append(f"USER: {msg['content']}")
+            elif msg["role"] == "assistant" and msg["content"].startswith("SQL:"):
+                # Only include SQL context, not full responses
+                history_lines.append(msg["content"])
+        
+        return "\n".join(history_lines)
     
     async def get_selective_history(
         self,

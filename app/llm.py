@@ -19,20 +19,14 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import httpx
 
 from .config import settings
 from .token_manager import TokenManager
 
-# Configure logging to print to stderr
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='[%(levelname)s] %(name)s: %(message)s',
-    stream=sys.stderr
-)
+# Use the global logger configured in main.py (writes to app.log)
 logger = logging.getLogger(__name__)
 
 
@@ -49,12 +43,14 @@ class LLMResponse:
 
 
 async def call_llm(
-    messages: List[Dict[str, str]],
+    messages: Union[str, List[Dict[str, str]]],
     stream: bool = False,
     max_tokens: int = 1024,
     temperature: float = 0.2,
     model: Optional[str] = None,
     track_tokens: bool = False,
+    json_mode: bool = False,
+    response_format: Optional[Dict[str, Any]] = None,
 ) -> Union[str, LLMResponse]:
     """Send a chat completion request to the configured AI service.
     
@@ -78,8 +74,74 @@ async def call_llm(
         
         Returns empty response if the call fails or no service is configured.
     """
-    logger.debug(f"[LLM] call_llm invoked with {len(messages)} messages to model {model or settings.ai_factory_model}")
-    print(f"[LLM] DEBUG: call_llm invoked with {len(messages)} messages", file=sys.stderr, flush=True)
+    def _normalize_messages(raw: Union[str, List[Dict[str, str]]]) -> List[Dict[str, str]]:
+        if isinstance(raw, str):
+            # Backward compatibility: many services pass a single prompt string.
+            # Wrap it into OpenAI-style messages.
+            return [
+                {"role": "system", "content": settings.llm_system_prompt},
+                {"role": "user", "content": raw},
+            ]
+        return raw
+
+    def _extract_json_fragment(text: str) -> str:
+        """Best-effort extraction of the first JSON object/array from text."""
+        candidate = (text or "").strip()
+        if not candidate:
+            return ""
+
+        # Fast-path: already valid JSON
+        try:
+            json.loads(candidate)
+            return candidate
+        except Exception:
+            pass
+
+        # Find first JSON object
+        start_candidates = [candidate.find("{"), candidate.find("[")]
+        starts = [i for i in start_candidates if i != -1]
+        if not starts:
+            return candidate
+
+        start = min(starts)
+        opener = candidate[start]
+        closer = "}" if opener == "{" else "]"
+
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(candidate)):
+            ch = candidate[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+                continue
+
+            if ch == opener:
+                depth += 1
+                continue
+            if ch == closer:
+                depth -= 1
+                if depth == 0:
+                    fragment = candidate[start : idx + 1]
+                    return fragment.strip()
+
+        return candidate[start:].strip()
+
+    normalized_messages = _normalize_messages(messages)
+    logger.debug(
+        f"[LLM] call_llm invoked with {len(normalized_messages)} messages to model {model or settings.ai_factory_model}"
+    )
     
     api = settings.ai_factory_api
     if not api:
@@ -92,19 +154,23 @@ async def call_llm(
     
     model_name = model or settings.ai_factory_model
     
-    payload = {
+    payload: Dict[str, Any] = {
         "model": model_name,
-        "messages": messages,
+        "messages": normalized_messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": stream,
     }
+
+    # Optional structured output hint (OpenAI-compatible servers may support this).
+    if response_format is not None:
+        payload["response_format"] = response_format
     
     # Token counting (if enabled)
     input_tokens = 0
     if track_tokens:
         token_mgr = TokenManager(model_name)
-        input_tokens = token_mgr.count_messages_tokens(messages)
+        input_tokens = token_mgr.count_messages_tokens(normalized_messages)
     
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -118,6 +184,17 @@ async def call_llm(
                 return LLMResponse("", input_tokens, None) if track_tokens else ""
             
             content = data["choices"][0]["message"]["content"]
+            
+            # Clean common prefixes that LLMs sometimes add
+            if content:
+                content = content.strip()
+                for prefix in ["ASSISTANT:", "Assistant:", "assistant:", "AI:", "Bot:"]:
+                    if content.startswith(prefix):
+                        content = content[len(prefix):].strip()
+                        break
+
+            if json_mode:
+                content = _extract_json_fragment(content)
             
             # Extract token usage from response if available
             output_tokens = 0
@@ -145,6 +222,54 @@ async def call_llm(
     except Exception as e:
         logger.error(f"[LLM] Unexpected error calling {api}: {type(e).__name__}: {str(e)[:200]}", exc_info=True)
         return LLMResponse("", input_tokens, None) if track_tokens else ""
+
+
+async def call_llm_json(
+    *,
+    system: str,
+    user: str,
+    model: Optional[str] = None,
+    temperature: float = 0.1,
+    max_tokens: int = 512,
+    response_format: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Convenience helper for LLM calls that must return JSON.
+
+    This is used by routing components that expect a JSON string.
+    It attempts a best-effort fallback when a provider doesn't support
+    the OpenAI `response_format` field.
+    """
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    # Attempt with response_format first (if provided)
+    if response_format is not None:
+        result = await call_llm(
+            messages,
+            stream=False,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            model=model,
+            json_mode=True,
+            response_format=response_format,
+        )
+        result_text = str(result) if isinstance(result, LLMResponse) else cast(str, result)
+        if result_text.strip():
+            return result_text
+
+    # Fallback: without response_format (for providers that reject the field)
+    result = await call_llm(
+        messages,
+        stream=False,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        model=model,
+        json_mode=True,
+        response_format=None,
+    )
+    return str(result) if isinstance(result, LLMResponse) else cast(str, result)
 
 
 async def embed_text(texts: List[str]) -> List[List[float]]:
@@ -175,9 +300,14 @@ async def embed_text(texts: List[str]) -> List[List[float]]:
                 resp.raise_for_status()
                 data = resp.json()
                 return [item["embedding"] for item in data.get("data", [])]
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[EMBEDDINGS] API call failed: {e}. Falling back to simple character-frequency embeddings.")
             pass
+    
     # Fallback: very simple vector based on character frequencies
+    # Pad to match configured embedding dimensions
+    target_dims = settings.embedding_dimensions
+    logger.warning(f"[EMBEDDINGS] Using fallback character-frequency embeddings (not suitable for production). Padding to {target_dims} dimensions.")
     vectors: List[List[float]] = []
     for t in texts:
         freq: Dict[str, float] = {}
@@ -187,5 +317,7 @@ async def embed_text(texts: List[str]) -> List[List[float]]:
         # normalise vector by length
         length = sum(freq.values()) or 1.0
         vector = [freq.get(chr(i), 0.0) / length for i in range(ord('a'), ord('z') + 1)]
+        # Pad with zeros to match configured embedding dimensions
+        vector.extend([0.0] * (target_dims - len(vector)))
         vectors.append(vector)
     return vectors

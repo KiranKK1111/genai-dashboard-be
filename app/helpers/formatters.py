@@ -11,6 +11,82 @@ from .. import models
 from ..token_manager import TokenManager
 
 
+def extract_assistant_message_text(response: Any) -> str:
+    """Extract assistant-readable text from a stored response payload.
+
+    The DB stores different response shapes depending on the route/mode.
+    This helper normalizes them to a plain-text assistant message for
+    conversation context.
+    """
+    if response is None:
+        return ""
+
+    # Pydantic models (best-effort)
+    if hasattr(response, "model_dump"):
+        try:
+            response = response.model_dump(mode="json")
+        except Exception:
+            pass
+
+    if isinstance(response, str):
+        return response.strip()
+
+    if not isinstance(response, dict):
+        return str(response).strip()
+
+    # Common legacy/standard shape
+    message = response.get("message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+
+    # LamaResponse shape: { assistant: { content: [ {type,text/items}, ... ] } }
+    assistant = response.get("assistant")
+    if isinstance(assistant, dict):
+        content = assistant.get("content")
+        if isinstance(content, list):
+            parts: List[str] = []
+            for block in content:
+                if isinstance(block, str):
+                    if block.strip():
+                        parts.append(block.strip())
+                    continue
+                if not isinstance(block, dict):
+                    block_str = str(block).strip()
+                    if block_str:
+                        parts.append(block_str)
+                    continue
+
+                block_text = block.get("text")
+                if isinstance(block_text, str) and block_text.strip():
+                    parts.append(block_text.strip())
+
+                items = block.get("items")
+                if isinstance(items, list) and items:
+                    bullet_lines: List[str] = []
+                    for item in items:
+                        item_str = "" if item is None else str(item).strip()
+                        if item_str:
+                            bullet_lines.append(f"- {item_str}")
+                    if bullet_lines:
+                        parts.append("\n".join(bullet_lines))
+
+            return "\n\n".join([p for p in parts if p]).strip()
+
+        # Fallbacks within assistant payload
+        assistant_message = assistant.get("message") or assistant.get("text")
+        if isinstance(assistant_message, str) and assistant_message.strip():
+            return assistant_message.strip()
+
+    # Sometimes nested under a top-level 'response'
+    nested = response.get("response")
+    if isinstance(nested, dict) and nested is not response:
+        nested_text = extract_assistant_message_text(nested)
+        if nested_text:
+            return nested_text
+
+    return ""
+
+
 def make_json_serializable(obj: Any) -> Any:
     """Convert non-JSON-serializable objects to JSON-safe format.
     
@@ -60,43 +136,43 @@ def format_conversation_context(messages: List[models.Message]) -> str:
     Converts database message records into a formatted string that can be
     included in the LLM prompt so it understands the conversation context.
     
+    CRITICAL: Includes SQL from debug metadata so follow-up queries can find it.
+    
     Args:
         messages: List of Message database objects from the session
         
     Returns:
-        Formatted conversation string for LLM context
+        Formatted conversation string for LLM context with SQL for follow-ups
     """
     if not messages:
         return ""
     
     formatted = "Previous conversation:\n"
+
     for msg in messages:
-        # Determine if this is a user query or assistant response
-        if msg.query and msg.responded_at is None:
-            # User message
+        # Skip placeholders/pending rows; they will be added as the current query separately.
+        if msg.responded_at is None:
+            continue
+
+        if msg.query:
             formatted += f"USER: {msg.query}\n"
-        elif msg.response and msg.responded_at is not None:
-            # Assistant response
-            response_type = msg.response_type if msg.response_type else "response"
-            
-            # Extract message content from response dict
-            if isinstance(msg.response, dict):
-                message_content = msg.response.get("message", "")
-                if message_content:
-                    formatted += f"ASSISTANT: {message_content}\n"
-                    
-                # Include metadata about data queries
-                metadata = msg.response.get("metadata", {})
-                if isinstance(metadata, dict) and metadata.get("type") == "data_query":
-                    # Could include row counts or other metadata if needed
-                    pass
-        else:
-            # Fallback for ambiguous cases
-            content = msg.query or str(msg.response.get("message", "")) if msg.response else ""
-            if content:
-                role = "USER" if msg.query else "ASSISTANT"
-                formatted += f"{role}: {content}\n"
-    
+
+        assistant_text = extract_assistant_message_text(msg.response)
+        if assistant_text:
+            formatted += f"ASSISTANT: {assistant_text}\n"
+
+        # CRITICAL FOR FOLLOW-UPS: Extract SQL from debug metadata
+        if isinstance(msg.response, dict):
+            debug_info = msg.response.get("debug", {})
+            if isinstance(debug_info, dict):
+                sql_executed = debug_info.get("sql_executed", "")
+                if sql_executed:
+                    formatted += f"[SQL] {sql_executed}\n"
+
+                row_count = debug_info.get("row_count")
+                if row_count is not None:
+                    formatted += f"[Results] {row_count} rows returned\n"
+
     return formatted
 
 

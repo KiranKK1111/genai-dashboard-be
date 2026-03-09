@@ -257,6 +257,24 @@ Response JSON:
             "scatter": await DynamicAggregatorGenerator._build_scatter(
                 numeric_fields, categorical_fields, suggestions
             ),
+            "treemap": await DynamicAggregatorGenerator._build_treemap(
+                categorical_fields, numeric_fields, id_fields, suggestions
+            ),
+            "funnel": await DynamicAggregatorGenerator._build_funnel(
+                categorical_fields, numeric_fields, suggestions
+            ),
+            "waterfall": await DynamicAggregatorGenerator._build_waterfall(
+                categorical_fields, numeric_fields, time_fields, suggestions
+            ),
+            "gantt": await DynamicAggregatorGenerator._build_gantt(
+                categorical_fields, time_fields, suggestions
+            ),
+            "sankey": await DynamicAggregatorGenerator._build_sankey(
+                categorical_fields, numeric_fields, suggestions
+            ),
+            "boxplot": await DynamicAggregatorGenerator._build_boxplot(
+                categorical_fields, numeric_fields, suggestions
+            ),
             "table": {
                 "auto_render_on_select": False,
                 "requires_transform": False,
@@ -608,6 +626,385 @@ Response JSON:
                 "fallback_color": "theme_primary"
             }
         }
+    
+    @staticmethod
+    async def _build_treemap(
+        categorical_fields: List[str],
+        numeric_fields: List[str],
+        id_fields: List[str],
+        suggestion: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Treemap: Hierarchical data visualization."""
+        
+        category_options = [f for f in categorical_fields if f not in id_fields]
+        if not category_options:
+            category_options = categorical_fields
+        
+        metric_field_options = ["*"] + numeric_fields
+        
+        return {
+            "auto_render_on_select": True,
+            "requires_transform": True,
+            "controls": [
+                {
+                    "id": "parent_dimension",
+                    "label": "Parent Category",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": category_options,
+                    "description": "Top-level grouping"
+                },
+                {
+                    "id": "child_dimension",
+                    "label": "Child Category (Optional)",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": category_options,
+                    "optional": True,
+                    "description": "Second-level grouping"
+                },
+                {
+                    "id": "size_metric",
+                    "label": "Size Metric",
+                    "kind": "metric",
+                    "type": "metric_builder",
+                    "metric_op_options": ["count", "sum", "avg"],
+                    "metric_field_options": metric_field_options,
+                    "numeric_fields": numeric_fields,
+                    "description": "Rectangle size"
+                }
+            ],
+            "default_selection": {
+                "parent_dimension": {"field": category_options[0] if category_options else ""},
+                "child_dimension": None,
+                "size_metric": {"op": "count", "field": "*", "as": "count"}
+            },
+            "numeric_fields": numeric_fields,
+            "categorical_fields": categorical_fields,
+            "transform_template": {
+                "type": "hierarchical_aggregate",
+                "parent": {"from_control": "parent_dimension"},
+                "child": {"from_control": "child_dimension"},
+                "size": {"from_control": "size_metric"}
+            },
+            "style": {
+                "palette_mode": "hierarchical",
+                "palette_name": "rainbow"
+            }
+        }
+    
+    @staticmethod
+    async def _build_funnel(
+        categorical_fields: List[str],
+        numeric_fields: List[str],
+        suggestion: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Funnel chart: Conversion stages visualization."""
+        
+        stage_options = categorical_fields if categorical_fields else ["stage"]
+        metric_field_options = ["*"] + numeric_fields
+        
+        return {
+            "auto_render_on_select": True,
+            "requires_transform": True,
+            "controls": [
+                {
+                    "id": "stage_dimension",
+                    "label": "Stage/Step",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": stage_options,
+                    "description": "Funnel stages in order"
+                },
+                {
+                    "id": "value_metric",
+                    "label": "Value Metric",
+                    "kind": "metric",
+                    "type": "metric_builder",
+                    "metric_op_options": ["count", "count_distinct", "sum"],
+                    "metric_field_options": metric_field_options,
+                    "numeric_fields": numeric_fields,
+                    "description": "Stage value/count"
+                },
+                {
+                    "id": "show_conversion_rate",
+                    "label": "Show Conversion %",
+                    "kind": "option",
+                    "type": "boolean",
+                    "description": "Display drop-off percentages"
+                }
+            ],
+            "default_selection": {
+                "stage_dimension": {"field": stage_options[0] if stage_options else ""},
+                "value_metric": {"op": "count", "field": "*", "as": "count"},
+                "show_conversion_rate": True
+            },
+            "numeric_fields": numeric_fields,
+            "categorical_fields": categorical_fields,
+            "transform_template": {
+                "type": "sequential_aggregate",
+                "stage": {"from_control": "stage_dimension"},
+                "value": {"from_control": "value_metric"}
+            },
+            "style": {
+                "palette_mode": "gradient",
+                "palette_name": "green_to_red"
+            }
+        }
+    
+    @staticmethod
+    async def _build_waterfall(
+        categorical_fields: List[str],
+        numeric_fields: List[str],
+        time_fields: List[str],
+        suggestion: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Waterfall chart: Cumulative effect visualization."""
+        
+        category_options = categorical_fields + time_fields if categorical_fields or time_fields else ["category"]
+        metric_field_options = ["*"] + numeric_fields
+        
+        return {
+            "auto_render_on_select": True,
+            "requires_transform": True,
+            "controls": [
+                {
+                    "id": "category_dimension",
+                    "label": "Category/Period",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": category_options,
+                    "description": "Sequential categories"
+                },
+                {
+                    "id": "value_metric",
+                    "label": "Value Metric",
+                    "kind": "metric",
+                    "type": "metric_builder",
+                    "metric_op_options": ["sum", "avg"],
+                    "metric_field_options": metric_field_options,
+                    "numeric_fields": numeric_fields,
+                    "description": "Positive/negative changes"
+                },
+                {
+                    "id": "show_totals",
+                    "label": "Show Running Total",
+                    "kind": "option",
+                    "type": "boolean",
+                    "description": "Display cumulative bars"
+                }
+            ],
+            "default_selection": {
+                "category_dimension": {"field": category_options[0] if category_options else ""},
+                "value_metric": {"op": "sum", "field": numeric_fields[0] if numeric_fields else "*", "as": "total"},
+                "show_totals": True
+            },
+            "numeric_fields": numeric_fields,
+            "categorical_fields": categorical_fields,
+            "transform_template": {
+                "type": "cumulative_aggregate",
+                "category": {"from_control": "category_dimension"},
+                "value": {"from_control": "value_metric"}
+            },
+            "style": {
+                "palette_mode": "conditional",
+                "positive_color": "green",
+                "negative_color": "red",
+                "total_color": "blue"
+            }
+        }
+    
+    @staticmethod
+    async def _build_gantt(
+        categorical_fields: List[str],
+        time_fields: List[str],
+        suggestion: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Gantt chart: Timeline/project visualization."""
+        
+        task_options = categorical_fields if categorical_fields else ["task"]
+        time_options = time_fields if time_fields else ["date"]
+        
+        return {
+            "auto_render_on_select": True,
+            "requires_transform": True,
+            "controls": [
+                {
+                    "id": "task_dimension",
+                    "label": "Task/Activity",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": task_options,
+                    "description": "Task names"
+                },
+                {
+                    "id": "start_date",
+                    "label": "Start Date",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": time_options,
+                    "allowed_field_types": ["date", "datetime"],
+                    "description": "Task start time"
+                },
+                {
+                    "id": "end_date",
+                    "label": "End Date",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": time_options,
+                    "allowed_field_types": ["date", "datetime"],
+                    "description": "Task end time"
+                },
+                {
+                    "id": "group_by",
+                    "label": "Group By (Optional)",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": categorical_fields,
+                    "optional": True,
+                    "description": "Group tasks by category"
+                }
+            ],
+            "default_selection": {
+                "task_dimension": {"field": task_options[0] if task_options else ""},
+                "start_date": {"field": time_options[0] if time_options else ""},
+                "end_date": {"field": time_options[1] if len(time_options) > 1 else time_options[0] if time_options else ""},
+                "group_by": None
+            },
+            "numeric_fields": [],
+            "categorical_fields": categorical_fields,
+            "transform_template": {
+                "type": "timeline",
+                "task": {"from_control": "task_dimension"},
+                "start": {"from_control": "start_date"},
+                "end": {"from_control": "end_date"},
+                "group": {"from_control": "group_by"}
+            },
+            "style": {
+                "palette_mode": "categorical",
+                "palette_name": "pastel"
+            }
+        }
+    
+    @staticmethod
+    async def _build_sankey(
+        categorical_fields: List[str],
+        numeric_fields: List[str],
+        suggestion: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Sankey diagram: Flow visualization."""
+        
+        category_options = categorical_fields if categorical_fields else ["source", "target"]
+        metric_field_options = ["*"] + numeric_fields
+        
+        return {
+            "auto_render_on_select": True,
+            "requires_transform": True,
+            "controls": [
+                {
+                    "id": "source_dimension",
+                    "label": "Source",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": category_options,
+                    "description": "Flow origin"
+                },
+                {
+                    "id": "target_dimension",
+                    "label": "Target",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": category_options,
+                    "description": "Flow destination"
+                },
+                {
+                    "id": "value_metric",
+                    "label": "Flow Value",
+                    "kind": "metric",
+                    "type": "metric_builder",
+                    "metric_op_options": ["count", "sum"],
+                    "metric_field_options": metric_field_options,
+                    "numeric_fields": numeric_fields,
+                    "description": "Flow magnitude"
+                }
+            ],
+            "default_selection": {
+                "source_dimension": {"field": category_options[0] if category_options else ""},
+                "target_dimension": {"field": category_options[1] if len(category_options) > 1 else category_options[0] if category_options else ""},
+                "value_metric": {"op": "count", "field": "*", "as": "flow_count"}
+            },
+            "numeric_fields": numeric_fields,
+            "categorical_fields": categorical_fields,
+            "transform_template": {
+                "type": "flow_aggregate",
+                "source": {"from_control": "source_dimension"},
+                "target": {"from_control": "target_dimension"},
+                "value": {"from_control": "value_metric"}
+            },
+            "style": {
+                "palette_mode": "flow",
+                "palette_name": "viridis"
+            }
+        }
+    
+    @staticmethod
+    async def _build_boxplot(
+        categorical_fields: List[str],
+        numeric_fields: List[str],
+        suggestion: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Box plot: Distribution analysis."""
+        
+        category_options = categorical_fields if categorical_fields else ["category"]
+        metric_options = numeric_fields if numeric_fields else ["value"]
+        
+        return {
+            "auto_render_on_select": True,
+            "requires_transform": True,
+            "controls": [
+                {
+                    "id": "category_dimension",
+                    "label": "Category (Optional)",
+                    "kind": "dimension",
+                    "type": "field",
+                    "field_options": category_options,
+                    "optional": True,
+                    "description": "Group distributions by category"
+                },
+                {
+                    "id": "value_metric",
+                    "label": "Value Field",
+                    "kind": "metric",
+                    "type": "field",
+                    "field_options": metric_options,
+                    "allowed_field_types": ["number", "integer"],
+                    "description": "Numeric field for distribution"
+                },
+                {
+                    "id": "show_outliers",
+                    "label": "Show Outliers",
+                    "kind": "option",
+                    "type": "boolean",
+                    "description": "Display outlier points"
+                }
+            ],
+            "default_selection": {
+                "category_dimension": None,
+                "value_metric": {"field": metric_options[0] if metric_options else ""},
+                "show_outliers": True
+            },
+            "numeric_fields": numeric_fields,
+            "categorical_fields": categorical_fields,
+            "transform_template": {
+                "type": "distribution_aggregate",
+                "category": {"from_control": "category_dimension"},
+                "value": {"from_control": "value_metric"}
+            },
+            "style": {
+                "palette_mode": "single",
+                "palette_name": "theme_primary"
+            }
+        }
 
 
 class DynamicVisualizationGenerator:
@@ -670,15 +1067,21 @@ class DynamicVisualizationGenerator:
             "emoji": "📊",
             "config": {
                 "primary_view": "table",
-                "available_views": ["table", "bar", "line", "pie", "scatter"]
+                "available_views": ["table", "bar", "line", "pie", "scatter", "treemap", "funnel", "waterfall", "gantt", "sankey", "boxplot"]
             },
             "field_schema": field_schema_dict,
             "aggregators": {
-                "views": ["bar", "line", "pie", "scatter", "table"],
+                "views": ["bar", "line", "pie", "scatter", "treemap", "funnel", "waterfall", "gantt", "sankey", "boxplot", "table"],
                 "bar": aggregators.get("bar", {}),
                 "line": aggregators.get("line", {}),
                 "pie": aggregators.get("pie", {}),
                 "scatter": aggregators.get("scatter", {}),
+                "treemap": aggregators.get("treemap", {}),
+                "funnel": aggregators.get("funnel", {}),
+                "waterfall": aggregators.get("waterfall", {}),
+                "gantt": aggregators.get("gantt", {}),
+                "sankey": aggregators.get("sankey", {}),
+                "boxplot": aggregators.get("boxplot", {}),
                 "table": aggregators.get("table", {}),
                 "common": aggregators.get("common", {})
             }

@@ -62,8 +62,10 @@ class DecisionOutput:
     followup_reasoning: Optional[str] = None
     
     def to_dict(self) -> Dict:
+        action_val = self.action.value if hasattr(self.action, 'value') else str(self.action)
+        followup_type_val = self.followup_type.value if (self.followup_type and hasattr(self.followup_type, 'value')) else (str(self.followup_type) if self.followup_type else None)
         return {
-            "action": self.action.value,
+            "action": action_val,
             "confidence": self.confidence,
             "reasoning": self.reasoning,
             "sql": self.sql,
@@ -75,7 +77,7 @@ class DecisionOutput:
             "needs_schema_lookup": self.needs_schema_lookup,
             "file_ids": self.file_ids,
             "is_followup": self.is_followup,
-            "followup_type": self.followup_type.value if self.followup_type else None,
+            "followup_type": followup_type_val,
             "followup_reasoning": self.followup_reasoning,
         }
 
@@ -126,12 +128,182 @@ class DecisionEngine:
             },
         }
     
+    def classify_query_category_strongly(self, query: str, files_in_session: bool = False) -> dict:
+        """
+        STRONG 3-CATEGORY CLASSIFICATION: File-based vs SQL-based vs Conversational.
+        
+        This method provides explicit, high-confidence classification for query types.
+        Useful as a validation layer or override for the LLM-based routing.
+        
+        Args:
+            query: User's natural language query
+            files_in_session: Whether files are available in current session
+            
+        Returns:
+            dict with keys:
+                - category: "FILE" | "SQL" | "CHAT"
+                - confidence: float 0.0-1.0 (how strong is this classification)
+                - reasoning: str (why this category)
+                - secondary_category: str (alternate category if uncertain)
+                - signals: dict (which signals triggered this classification)
+        """
+        query_lower = query.lower()
+        signals = {}
+        
+        # ========================
+        # QUICK PRIORITY CHECKS
+        # ========================
+        
+        # PRIORITY 1: STRONG CONCEPTUAL PATTERNS (override everything)
+        conceptual_patterns = [
+            ("what is", "What is pattern"),
+            ("explain", "Explain pattern"),
+            ("how does", "How does pattern"),
+            ("why ", "Why pattern"),
+            ("what does", "What does pattern"),
+            ("define", "Define pattern"),
+            ("tell me about", "Tell me about pattern"),
+        ]
+        
+        for pattern, reason in conceptual_patterns:
+            if pattern in query_lower and "file" not in query_lower and "document" not in query_lower:
+                return {
+                    "category": "CHAT",
+                    "confidence": 0.90,
+                    "reasoning": f"Strong conceptual question pattern detected: '{pattern}'",
+                    "secondary_category": "SQL",
+                    "signals": {"priority": "conceptual_pattern"},
+                }
+        
+        # PRIORITY 2: STRONG FILE PATTERNS
+        file_patterns = [
+            ("analyze", "file|document|pdf|spreadsheet|csv"),
+            ("summarize", "file|document|pdf"),
+            ("extract", "file|document|pdf"),
+            ("compare", "document|file|pdf"),
+            ("review", "document|file|pdf"),
+            ("read", "document|file|pdf"),
+            ("what does", "document|file|say"),
+            ("uploaded", ""),
+            ("attached", ""),
+            ("this document", ""),
+            ("the document", ""),
+            ("my file", ""),
+        ]
+        
+        if files_in_session:
+            for verb, entities in file_patterns:
+                if verb in query_lower:
+                    if not entities or any(e in query_lower for e in entities.split("|")):
+                        return {
+                            "category": "FILE",
+                            "confidence": 0.92,
+                            "reasoning": f"Strong file operation pattern detected: '{verb}'",
+                            "secondary_category": "SQL",
+                            "signals": {"priority": "file_pattern"},
+                        }
+        
+        # ========================
+        # STANDARD SIGNAL CALCULATION
+        # ========================
+        
+        # FILE-BASED SIGNALS
+        file_signals = {
+            "upload_mention": any(w in query_lower for w in ["upload", "uploaded", "attach", "attached"]),
+            "file_keyword": any(w in query_lower for w in ["document", "file", "pdf", "spreadsheet", "csv", "excel"]),
+            "file_analysis": any(w in query_lower for w in ["analyze", "read", "review", "extract", "search", "summarize", "compare", "what does"]),
+            "file_reference": any(w in query_lower for w in ["the document", "the file", "the pdf", "that file", "my attachment", "this document", "this file", "my file"]),
+        }
+        file_score = sum(file_signals.values())
+        signals["file"] = file_signals
+        
+        # SQL-BASED SIGNALS (generic patterns, not domain-specific keywords)
+        sql_signals = {
+            "retrieval_verb": any(w in query_lower for w in ["show", "get", "find", "list", "retrieve", "display", "want to see", "looking for", "need to see", "can you get"]),
+            "data_entity": any(w in query_lower for w in ["all", "every", "each", "data", "records", "entries", "rows"]),  # Generic data retrieval terms
+            "explicit_db_ref": any(w in query_lower for w in ["database", "table", "from table", "from the database"]),
+            "temporal_filter": any(w in query_lower for w in ["today", "yesterday", "last week", "last month", "this year", "this month", "recent", "past", "since", "between"]),
+            "numeric_aggregate": any(w in query_lower for w in ["count", "sum", "average", "total", "max", "min", "how many", "top", "most", "least"]),
+        }
+        sql_score = sum(sql_signals.values())
+        signals["sql"] = sql_signals
+        
+        # CONVERSATIONAL SIGNALS
+        chat_signals = {
+            "conceptual": any(w in query_lower for w in ["what is", "explain", "how does", "why", "define"]),
+            "abstract": any(w in query_lower for w in ["algorithm", "design", "architecture", "pattern", "approach"]),
+            "discussion": any(w in query_lower for w in ["think", "discuss", "opinion", "thoughts", "help me understand"]),
+        }
+        chat_score = sum(chat_signals.values())
+        signals["chat"] = chat_signals
+        
+        # ========================
+        # DECISION LOGIC (WITH IMPROVED THRESHOLDS)
+        # ========================
+        
+        # FILE-BASED DECISION
+        if files_in_session and file_score >= 2:
+            return {
+                "category": "FILE",
+                "confidence": min(0.90 + (0.05 * min(file_score, 3)), 1.0),
+                "reasoning": f"Strong file-based signals: {file_score} indicators",
+                "secondary_category": "SQL",
+                "signals": signals,
+            }
+        
+        # SQL-BASED DECISION (requires at least 2 clear signals)
+        # "Retrieval verb + data entity" is a strong SQL signal
+        has_retrieval = sql_signals["retrieval_verb"]
+        has_entity = sql_signals["data_entity"]
+        
+        if has_retrieval and (has_entity or sql_score >= 2):
+            # Clear data retrieval intent
+            confidence = 0.88 if (has_retrieval and has_entity) else 0.78
+            return {
+                "category": "SQL",
+                "confidence": min(confidence + (0.07 * min(sql_score - 2, 1)), 1.0),
+                "reasoning": f"SQL-based retrieval signals: {sql_score} indicators (retrieval={has_retrieval}, entity={has_entity})",
+                "secondary_category": "CHAT",
+                "signals": signals,
+            }
+        
+        # Fallback for moderate SQL signals
+        if sql_score >= 3:
+            return {
+                "category": "SQL",
+                "confidence": min(0.75 + (0.10 * min(sql_score - 3, 2)), 1.0),
+                "reasoning": f"Moderate SQL signals: {sql_score} indicators",
+                "secondary_category": "CHAT",
+                "signals": signals,
+            }
+        
+        # CHAT-BASED DECISION (when no strong SQL or FILE signals)
+        if chat_score >= 1 and sql_score <= 1:
+            return {
+                "category": "CHAT",
+                "confidence": min(0.82 + (0.10 * chat_score), 1.0),
+                "reasoning": f"Conversational signals with minimal data intent",
+                "secondary_category": "SQL",
+                "signals": signals,
+            }
+        
+        # Default to CHAT with moderate confidence when unclear
+        return {
+            "category": "CHAT",
+            "confidence": 0.65,
+            "reasoning": f"Unclear intent (sql={sql_score}, chat={chat_score}, file={file_score}) - defaulting to conversation",
+            "secondary_category": "SQL" if sql_score >= 1 else "FILE",
+            "signals": signals,
+        }
+    
     async def decide(
         self,
         user_message: str,
         files_uploaded: bool = False,
         conversation_history: Optional[str] = None,
         database_available: bool = True,
+        db=None,
+        session_id: str = None
     ) -> DecisionOutput:
         """
         Stage 1 of the tool selection pipeline: semantic intent understanding.
@@ -149,6 +321,102 @@ class DecisionEngine:
             DecisionOutput: Structured tool selection decision
         """
         
+        if files_uploaded:
+            return DecisionOutput(
+                action=Action.ANALYZE_FILES,
+                confidence=1.0,
+                reasoning="File(s) uploaded in current message - directing to file analysis",
+            )
+
+        # ✅ SEMANTIC ROUTING (pure LLM-based, no hardcoded keywords)
+        # Use LLM to semantically understand intent and route to correct tool
+        from .semantic_tool_router import SemanticToolRouter, ToolType, FollowupDomain
+        
+        router = SemanticToolRouter()
+        
+        # ✅ SET SCHEMA CONTEXT for better database query detection
+        # This tells the router what tables exist so it can match user queries that mention table names
+        try:
+            # First try to get table names from the catalog (if populated)
+            from .semantic_schema_catalog import get_catalog
+            catalog = get_catalog()
+            if catalog and catalog.tables:
+                table_names = list(catalog.tables.keys())
+                router.set_schema_context(table_names)
+                logger.debug(f"[DECISION] Set schema context from catalog with {len(table_names)} tables")
+            else:
+                # Fallback: Query table names directly from database
+                from sqlalchemy import text
+                from ..config import settings
+                schema_name = settings.postgres_schema or "genai"
+                result = await db.execute(text(f"""
+                    SELECT table_name 
+                    FROM information_schema.tables 
+                    WHERE table_schema = '{schema_name}' 
+                    AND table_type = 'BASE TABLE'
+                """))
+                table_names = [row[0] for row in result.fetchall()]
+                if table_names:
+                    router.set_schema_context(table_names)
+                    logger.info(f"[DECISION] Set schema context from DB with {len(table_names)} tables: {table_names}")
+        except Exception as e:
+            logger.warning(f"[DECISION] Could not load schema context for routing: {e}")
+        
+        # Get files in session for context
+        files_in_session = await self._check_files_in_session(db, session_id)
+        file_names = []
+        if files_in_session:
+            # TODO: Retrieve actual file names from session
+            file_names = ["(files in session)"]
+        
+        # Get last tool context for semantic routing
+        last_tool = None  # TODO: Get from session_state_manager
+        last_sql_context = None  # TODO: Get from session_state_manager
+        last_file_context = None  # TODO: Get from session_state_manager
+        
+        # Semantic routing
+        routing_result = await router.route_query(
+            user_query=user_message,
+            files_in_session=files_in_session,
+            file_names=file_names,
+            last_tool_used=last_tool,
+            last_sql_context=last_sql_context,
+            last_file_context=last_file_context,
+            conversation_history=conversation_history,
+        )
+        
+        # If LLM indicates clarification needed, ask immediately
+        if routing_result.needs_clarification:
+            logger.info(f"[DECISION] Semantic router requested clarification: {routing_result.clarification_question}")
+            return DecisionOutput(
+                action=Action.CHAT,  # Return CHAT for clarification
+                confidence=routing_result.confidence,
+                reasoning=routing_result.clarification_question,
+                needs_clarification=True,
+                clarifying_question=routing_result.clarification_question,
+                is_followup=True,
+                followup_type=FollowUpType.CLARIFICATION,
+                followup_reasoning="Semantic router uncertain about intent",
+            )
+        
+        # Convert ToolType to Action
+        action = {
+            ToolType.RUN_SQL: Action.RUN_SQL,
+            ToolType.ANALYZE_FILES: Action.ANALYZE_FILES,
+            ToolType.CHAT: Action.CHAT,
+        }[routing_result.tool]
+        
+        tool_val = routing_result.tool.value if hasattr(routing_result.tool, 'value') else str(routing_result.tool)
+        domain_val = routing_result.followup_domain.value if hasattr(routing_result.followup_domain, 'value') else str(routing_result.followup_domain)
+        return DecisionOutput(
+            action=action,
+            confidence=routing_result.confidence,
+            reasoning=routing_result.reasoning,
+            is_followup=routing_result.followup_domain != FollowupDomain.CHAT,
+            followup_type=FollowUpType.REFINEMENT if routing_result.followup_domain != FollowupDomain.CHAT else None,
+            followup_reasoning=f"Semantic routing to {tool_val} (domain: {domain_val})",
+        )
+
         max_retries = 3
         confidence_retry_threshold = 0.65
         retry_count = 0
@@ -195,14 +463,46 @@ class DecisionEngine:
                     continue
                 
                 decision = self._parse_decision_response(response, user_message)
+
+                # --- RAG-based follow-up detection for file analysis ---
+                # If not files_uploaded, but this is a follow-up, check if query refers to previous files using vector search
+                if (
+                    not files_uploaded
+                    and decision.is_followup
+                    and db is not None
+                    and session_id is not None
+                ):
+
+                    try:
+                        from ..services.file_handler import retrieve_relevant_chunks
+                        logger.debug(f"[DECISION][RAG] Checking for file-based follow-up: session_id={session_id}, user_message='{user_message}'")
+                        relevant_chunks = await retrieve_relevant_chunks(db, session_id, user_message, top_k=1)
+                        logger.debug(f"[DECISION][RAG] Retrieved {len(relevant_chunks) if relevant_chunks else 0} relevant chunk(s)")
+                        
+                        # Check if we got any chunks (now returns just chunks, not tuples)
+                        if relevant_chunks and len(relevant_chunks) > 0:
+                            chunk = relevant_chunks[0]
+                            logger.debug(f"[DECISION][RAG] Top chunk found from file: {chunk.file_id}")
+                            # If chunk has embedding, consider it relevant
+                            if hasattr(chunk, "embedding") and chunk.embedding:
+                                logger.info(f"[DECISION][RAG] Query matches previous file content; routing to file analysis.")
+                                decision.action = Action.ANALYZE_FILES
+                                decision.reasoning += f" | RAG: Query matches previous file content; routing to file analysis."
+                            else:
+                                logger.debug(f"[DECISION][RAG] Top chunk similarity below threshold or missing embedding; skipping file analysis override.")
+                        else:
+                            logger.debug(f"[DECISION][RAG] No sufficiently relevant file chunk found for this follow-up query.")
+                    except Exception as e:
+                        logger.warning(f"[DECISION] RAG file follow-up detection failed: {e}")
                 
                 # ✅ Check if confidence is too low to retry
                 if decision.confidence < confidence_retry_threshold and retry_count < max_retries - 1:
                     retry_count += 1
+                    action_val = decision.action.value if hasattr(decision.action, 'value') else str(decision.action)
                     logger.info(
                         f"[DECISION] Low confidence ({decision.confidence:.2f}) detected - "
                         f"Retrying ({retry_count}/{max_retries - 1})... "
-                        f"Previous action: {decision.action.value}"
+                        f"Previous action: {action_val}"
                     )
                     continue
                 
@@ -247,12 +547,12 @@ class DecisionEngine:
             "1. DATA REQUEST (RUN_SQL): User wants data returned",
             "   Semantic markers (discovered through analysis, not rules):",
             "   • User is ASKING FOR something to be retrieved/returned",
-            "   • Nouns are DATA ENTITIES (customers, orders, products, records)",
+            "   • Nouns are DATA ENTITIES (tables/views/entities/records)",
             "   • Verbs are ACTION-ORIENTED (want, get, retrieve, show, display, find)",
             "   • Expected outcome: SQL query + structured data results",
-            "   • Example analysis: 'I want to get all credit card customers'",
+            "   • Example analysis: 'I want to get all rows from a database table'",
             "     → Is user asking FOR data? YES (want + get = retrieval intent)",
-            "     → Are entities mentioned? YES (customers, credit card type)",
+            "     → Are entities mentioned? YES (a table/entity name, optional attribute filter)",
             "     → Expected output? Data records from database",
             "     → Decision: RUN_SQL (not based on keywords, but semantic intent)",
             "",
@@ -284,7 +584,7 @@ class DecisionEngine:
             "",
             "STEP 3: Assess DATA RELEVANCE",
             "  • Does this query assume database exists? (implicit or explicit)",
-            "  • Are database entities mentioned? (table-like nouns: customers, orders, etc)",
+            "  • Are database entities mentioned? (table-like nouns: entity/table names)",
             "  • Is the user seeking to RETRIEVE or FILTER data?",
             "",
             "STEP 4: Make CONFIDENT DECISION",
@@ -307,7 +607,7 @@ class DecisionEngine:
                 f"• RUN_SQL: Query database for specific data",
                 "  - Use when: User's semantic intent is DATA TRANSACTION (retrieving/filtering)",
                 "  - Key signals: Wants data returned, mentions data entities, seeks analysis",
-                "  - Examples: 'get all customers', 'show sales data', 'find recent orders'",
+                "  - Examples: 'get all records', 'show recent entries', 'find rows from last month'",
                 "  - Confidence drivers: Clear data intent + identifiable entities + retrieval goal",
                 ""
             ])
@@ -328,25 +628,25 @@ class DecisionEngine:
             "CRITICAL RULE (Learned Semantic Pattern):",
             "",
             "If the user statement contains action verbs (want, get, show, retrieve, find, display)",
-            "   + CONCRETE NOUNS (customers, orders, products, records, data)",
+            "   + CONCRETE NOUNS (tables, records, rows, data)",
             "   → This is DATA RETRIEVAL INTENT",
             "   → RUN_SQL (confidence >= 0.85, not based on keyword matching)",
             "",
             "EXAMPLE REASONING (semantic, not rule-based):",
-            "  User: 'I want to get all credit card customers'",
+            "  User: 'I want to get all rows from a database table'",
             "  Analysis:",
-            "    1. Intent structure: Action verb (want + get) + concrete noun (customers)",
+            "    1. Intent structure: Action verb (want + get) + concrete noun (rows/records)",
             "    2. Semantic role: User is REQUESTING data to be retrieved",
-            "    3. Entities: 'customers' (data entity), 'credit card' (filter/attribute)",
-            "    4. Database relevance: YES (customers implies database table)",
-            "    5. Expected output: List of customer records from database",
+            "    3. Entities: table/entity name (data entity), optional attribute filter",
+            "    4. Database relevance: YES (table/entity implies database access)",
+            "    5. Expected output: List of records from the database",
             "    → DECISION: RUN_SQL (confidence 0.92)",
             "    → Reasoning: Clear data retrieval intent—user wants database records",
             "",
             "CONTRAST (semantic understanding):",
-            "  User: 'What is a credit card?'",
+            "  User: 'What is a database index?'",
             "  Analysis:",
-            "    1. Intent structure: Knowledge verb (what is) + abstract noun (credit card concept)",
+            "    1. Intent structure: Knowledge verb (what is) + abstract noun (concept)",
             "    2. Semantic role: User is ASKING ABOUT a concept",
             "    3. Entities: CONCEPTUAL (no specific data entity)",
             "    4. Database relevance: NO (conceptual question)",
@@ -397,26 +697,26 @@ class DecisionEngine:
             "=== JSON RESPONSE EXAMPLES (Semantic Reasoning) ===",
             "",
             'EXAMPLE 1 (Data Retrieval - RUN_SQL):',
-            '  User: "I want to get all credit card customers"',
+            '  User: "Get all records where status is active"',
             '  JSON:',
             '  {',
             '    "action": "RUN_SQL",',
             '    "confidence": 0.92,',
-            '    "reasoning": "User is requesting to retrieve customers with credit card filter",',
-            '    "extracted_entities": {"primary_entity": "customers", "filter_type": "credit card"},',
-            '    "extracted_filters": {"card_type": "credit card"},',
+            '    "reasoning": "User is requesting to retrieve records with an explicit filter",',
+            '    "extracted_entities": {"primary_entity": "table_name"},',
+            '    "extracted_filters": {"status": "active"},',
             '    "ambiguity_score": 0.1,',
             '    "needs_clarification": false,',
             '    "is_followup": false',
             '  }',
             "",
             'EXAMPLE 2 (Conceptual - CHAT):',
-            '  User: "What is a credit card?"',
+            '  User: "What is a database index?"',
             '  JSON:',
             '  {',
             '    "action": "CHAT",',
             '    "confidence": 0.95,',
-            '    "reasoning": "User asking conceptual question about credit card topic",',
+            '    "reasoning": "User asking a conceptual question (no data retrieval)",',
             '    "extracted_entities": {},',
             '    "extracted_filters": {},',
             '    "ambiguity_score": 0.0,',
@@ -650,11 +950,11 @@ class DecisionEngine:
             needs_clarification = False
             clarifying_question = None
             
+
             # If LLM explicitly flagged it, trust that
             if llm_needs_clarification and user_clarifying_question:
                 needs_clarification = True
                 clarifying_question = user_clarifying_question
-            
             # OR: Confidence-based logic (no hardcoded thresholds, learned)
             # These thresholds represent learned behavioral boundaries
             elif confidence < 0.75 and ambiguity_score > 0.4:
@@ -667,6 +967,9 @@ class DecisionEngine:
                     extracted_filters=extracted_filters,
                     ambiguity_score=ambiguity_score
                 )
+
+            if needs_clarification and clarifying_question:
+                action = Action.CHAT  # Route to conversation for clarification
             
             return DecisionOutput(
                 action=action,
@@ -726,6 +1029,42 @@ class DecisionEngine:
         
         else:  # CHAT
             return "Can you clarify what you're asking?"
+    
+    async def _check_files_in_session(self, db, session_id: str) -> bool:
+        """
+        Check if any files were uploaded/analyzed in this session (ChatGPT-like behavior).
+        
+        Enables follow-up detection for previously uploaded files.
+        
+        Args:
+            db: Database session
+            session_id: Chat session ID
+            
+        Returns:
+            bool: True if files exist in this session, False otherwise
+        """
+        if not db or not session_id:
+            return False
+        
+        try:
+            from sqlalchemy import select
+            from .. import models
+            
+            # Check if any uploaded files are associated with this session
+            result = await db.execute(
+                select(models.UploadedFile).where(
+                    models.UploadedFile.session_id == session_id
+                ).limit(1)
+            )
+            file_exists = result.scalars().first() is not None
+            
+            if file_exists:
+                logger.debug(f"[DECISION] Files found in session {session_id}")
+            
+            return file_exists
+        except Exception as e:
+            logger.debug(f"[DECISION] Error checking files in session: {e}")
+            return False
     
     def _fallback_decision(self, user_message: str) -> DecisionOutput:
         """

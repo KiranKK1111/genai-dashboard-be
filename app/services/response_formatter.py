@@ -1,7 +1,7 @@
 """Intelligent response formatting for follow-up questions and data queries.
 
 This module provides smart formatting that returns simple messages for single values
-(like "is it credit or debit?") instead of full tables, while still using tables
+(like "what is its status?") instead of full tables, while still using tables
 for complex multi-row results.
 """
 
@@ -20,9 +20,9 @@ async def should_return_as_message(
     """Determine if results should be returned as a simple message instead of a table.
 
     This handles follow-up questions like:
-    - "is it credit or debit?" → Extract direction from result
-    - "what type of transaction?" → Extract txn_type from result
-    - "how much?" → Extract amount from result
+    - "what is the status?" → Extract a status-like field from result
+    - "what type is it?" → Extract a type/category-like field from result
+    - "how much?" → Extract an amount/value-like field from result
 
     Args:
         query: The user's query
@@ -38,11 +38,11 @@ async def should_return_as_message(
 
     # Check if this looks like a follow-up question asking for a property
     followup_patterns = {
-        r'\b(is it|what(?:\s+kind)?|what\s+type|which|how much|how many|can you tell|what about|is that)\b': 'property_question',
-        r'\b(credit|debit|direction)\b': 'direction_question',
-        r'\b(amount|total|balance)\b': 'amount_question',
-        r'\b(merchant|customer|account|person)\b': 'entity_question',
-        r'\b(time|date|when)\b': 'time_question',
+        r"\b(is it|what(?:\s+kind)?|what\s+type|which|how much|how many|when|where|who|can you tell|what about|is that)\b": "property_question",
+        r"\b(direction|inbound|outbound|incoming|outgoing)\b": "direction_question",
+        r"\b(amount|total|balance|price|cost|value)\b": "amount_question",
+        r"\b(status|state|category|type|kind)\b": "attribute_question",
+        r"\b(time|date|when|created|updated|timestamp)\b": "time_question",
     }
 
     # Check if query matches any follow-up patterns
@@ -55,14 +55,9 @@ async def should_return_as_message(
             break
 
     # Only format as message if:
-    # 1. This appears to be a follow-up question
-    # 2. We have exactly 1 or 2 rows (single transaction or couple of results)
-    # 3. Conversation history mentions previous data query
+    # 1. This appears to be a follow-up question asking for a specific property
+    # 2. We have exactly 1-3 rows (single record or a couple of results)
     if not is_followup or len(rows) > 3:
-        return False, None
-
-    has_context = 'transaction' in conversation_history.lower() or 'customer' in conversation_history.lower()
-    if not has_context:
         return False, None
 
     # Use LLM to extract key information and format as natural message
@@ -79,9 +74,9 @@ IMPORTANT:
 - NO explanation, NO table format, NO JSON
 - Be conversational like ChatGPT
 - Examples:
-  * Query "is it credit or debit?" → "This transaction is a credit (incoming payment)."
-  * Query "how much?" → "This transaction is for $90,016.32"
-  * Query "what type?" → "This is an IMPS_IN transaction (incoming IMPS transfer)"
+    * Query "what is the status?" → "The status is ACTIVE."
+    * Query "how much?" → "The amount is 90016.32."
+    * Query "when was it created?" → "It was created on 2024-01-15."
 
 Return only the concise answer:"""
 
@@ -198,27 +193,57 @@ def extract_key_value(row: Dict[str, Any], query: str) -> Optional[str]:
     if not row:
         return None
 
-    # Map of keywords to database column names
-    keyword_column_map = {
-        r'\b(credit|debit|direction)\b': ['direction', 'txn_type'],
-        r'\b(amount|total|balance|how\s+much)\b': ['amount', 'post_balance', 'balance'],
-        r'\b(merchant|company)\b': ['merchant_id', 'merchant_code'],
-        r'\b(customer|account)\b': ['customer_id', 'customer_code', 'account_id'],
-        r'\b(type|kind|what)\b': ['txn_type', 'type', 'direction'],
-        r'\b(time|date|when)\b': ['txn_time', 'created_at', 'date'],
-        r'\b(note|description|remark)\b': ['note', 'description', 'remarks'],
-    }
-
-    # Find matching keywords in query
-    for keyword_pattern, column_names in keyword_column_map.items():
-        if re.search(keyword_pattern, query, re.IGNORECASE):
-            # Try to extract from first matching column
-            for col in column_names:
-                if col in row and row[col] is not None:
-                    value = row[col]
-                    # Format the value nicely
-                    if isinstance(value, str):
-                        return value.replace('_', ' ').title()
+    # Dynamic column detection using available data
+    # ZERO HARDCODING: Use actual column names from result
+    available_columns = list(row.keys())
+    
+    # Simple heuristic matching - can be enhanced with LLM if needed
+    query_lower = query.lower()
+    
+    # Priority-based matching
+    # 1. Amount/Balance queries
+    if any(word in query_lower for word in ['amount', 'total', 'balance', 'how much', 'cost', 'price']):
+        for col in available_columns:
+            col_lower = col.lower()
+            if any(keyword in col_lower for keyword in ['amount', 'balance', 'total', 'price', 'cost', 'value']):
+                value = row[col]
+                if value is not None:
                     return str(value)
-
-    return None
+    
+    # 2. Type/Category queries
+    if any(word in query_lower for word in ['type', 'kind', 'what', 'category']):
+        for col in available_columns:
+            col_lower = col.lower()
+            if any(keyword in col_lower for keyword in ['type', 'category', 'kind', 'direction', 'status']):
+                value = row[col]
+                if value is not None and isinstance(value, str):
+                    return value.replace('_', ' ').title()
+    
+    # 3. Time/Date queries
+    if any(word in query_lower for word in ['time', 'date', 'when']):
+        for col in available_columns:
+            col_lower = col.lower()
+            if any(keyword in col_lower for keyword in ['time', 'date', 'created', 'updated', 'timestamp']):
+                value = row[col]
+                if value is not None:
+                    return str(value)
+    
+    # 4. ID queries
+    if any(word in query_lower for word in ['id', 'code', 'number', 'identifier']):
+        for col in available_columns:
+            col_lower = col.lower()
+            if any(keyword in col_lower for keyword in ['id', 'code', 'number', 'key']):
+                value = row[col]
+                if value is not None:
+                    return str(value)
+    
+    # 5. Fallback: Return first non-null, non-id column
+    for col in available_columns:
+        col_lower = col.lower()
+        # Skip likely ID columns in fallback
+        if not any(skip in col_lower for skip in ['_id', 'id_', 'uuid', 'guid']):
+            value = row[col]
+            if value is not None:
+                if isinstance(value, str):
+                    return value.replace('_', ' ').title()
+                return str(value)

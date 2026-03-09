@@ -11,7 +11,9 @@ Uses pure LLM-driven classification - NO hardcoded keywords or patterns.
 
 from __future__ import annotations
 
+import asyncio
 import re
+import json
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -69,8 +71,9 @@ class FollowUpContext:
             return ""
         
         ctx = self.previous_context
+        followup_type_val = self.followup_type.value if hasattr(self.followup_type, 'value') else str(self.followup_type)
         section = f"""PREVIOUS QUERY CONTEXT:
-Type: {self.followup_type.value.upper()}
+Type: {followup_type_val.upper()}
 Confidence: {self.confidence:.0%}
 
 Previous user asked: {ctx.query_text}
@@ -98,7 +101,8 @@ Previous filters applied:
         if not self.is_followup:
             return f"[FOLLOWUP] No follow-up detected (confidence: {self.confidence:.0%})"
         
-        msg = f"[FOLLOWUP] Type: {self.followup_type.value.upper()}, Confidence: {self.confidence:.0%}\n"
+        followup_type_val = self.followup_type.value if hasattr(self.followup_type, 'value') else str(self.followup_type)
+        msg = f"[FOLLOWUP] Type: {followup_type_val.upper()}, Confidence: {self.confidence:.0%}\n"
         msg += f"[FOLLOWUP] Reasoning: {self.reasoning}\n"
         
         if self.previous_context:
@@ -144,6 +148,11 @@ class FollowUpAnalyzer:
         """
         Analyze if current query is a follow-up and what type it is.
         
+        Uses LLM semantic analysis to intelligently detect:
+        - Is this a follow-up query (vs entirely new question)?
+        - What type: REFINEMENT (add filters), EXPANSION (remove filters), etc.
+        - Extract context from previous works
+        
         Args:
             current_query: User's current query
             conversation_history: Formatted previous conversation
@@ -166,36 +175,204 @@ class FollowUpAnalyzer:
                 reasoning="No previous conversation context available"
             )
         
-        # NOTE: All primary routing is now handled by DecisionEngine
-        # Follow-up detection has been simplified to reduce classifier dependency
-        return FollowUpContext(
-            is_followup=False,
-            followup_type=FollowUpType.NEW,
-            confidence=0.0,
-            previous_context=None,
-            reasoning="Primary routing handled by DecisionEngine"
-        )
+        # STEP 1: Extract previous user query from conversation
+        # This is what we'll compare against
+        previous_query = self._extract_previous_query(conversation_history)
+        
+        if not previous_query:
+            return FollowUpContext(
+                is_followup=False,
+                followup_type=FollowUpType.NEW,
+                confidence=0.0,
+                previous_context=None,
+                reasoning="No previous user query found in conversation"
+            )
+        
+        # STEP 2: Use LLM to semantically analyze if this is a follow-up
+        # This is the core intelligence - LLM decides if queries are related
+        from ..llm import call_llm
+        
+        followup_detection_prompt = f"""Analyze if the CURRENT QUERY is a follow-up to the PREVIOUS QUERY:
+
+PREVIOUS QUERY: {previous_query}
+CURRENT QUERY: {current_query}
+PREVIOUS SQL: {previous_sql if previous_sql else "Not available"}
+
+Look specifically for these ChatGPT-level conversational patterns:
+1. REFERENTIAL EXPRESSIONS: "those", "them", "these", "that data", "those results", "the ones"
+2. IMPLICIT CONTINUATIONS: "list all", "show me", "get details" without explicit subject
+3. CONTEXTUAL MODIFIERS: "only the approved ones", "just in Q1", "for last month"
+4. RESULT-BASED QUERIES: "why is X high?", "show details", "export this", "visualize it"
+5. ENTITY CONTINUATIONS: Previous asked about "customers", current asks about "clients" (same entity)
+
+Determine:
+1. Is CURRENT QUERY a follow-up? (refining/clarifying/expanding on PREVIOUS)
+2. If yes, what type of follow-up?
+   - REFINEMENT: Adding more filters/constraints (e.g., "only approved ones", "in Q1", "for year 2024")
+   - EXPANSION: Relaxing filters or showing more results (e.g., "show all", "everything")  
+   - CLARIFICATION: Asking about specific row(s) from previous result (e.g., "why is X high?", "show details of top one")
+   - PIVOT: Different table/entity but uses previous results as context (e.g., asked about one table, now asking about a related table)
+   - CONTINUATION: Continue previous query in different way (e.g., "list all those clients" after asking "how many clients")
+3. Confidence 0.0-1.0: How confident are you?
+
+CRITICAL: "list all those clients" after "how many clients have birthdays in Mar?" is a CONTINUATION (confidence 0.9+)
+The user wants to see the actual records, not just the count.
+
+Return ONLY valid JSON (no markdown/explanation):
+{{
+    "is_followup": true/false,
+    "followup_type": "REFINEMENT" | "EXPANSION" | "CLARIFICATION" | "PIVOT" | "CONTINUATION" | "NEW",
+    "confidence": 0.0-1.0,
+    "reasoning": "brief explanation"
+}}"""
+        
+        try:
+            messages = [
+                {"role": "system", "content": "You are an expert at understanding conversation context and query relationships."},
+                {"role": "user", "content": followup_detection_prompt},
+            ]
+            
+            # Use a 10-second timeout for the LLM call to prevent hanging
+            try:
+                response_text = await asyncio.wait_for(
+                    call_llm(messages, stream=False, max_tokens=300),
+                    timeout=30.0  # Increased for better analysis
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[FOLLOWUP] LLM call timed out after 10s, using fallback")
+                response_text = ""
+            
+            # Parse LLM response
+            if isinstance(response_text, str):
+                response_str = response_text
+            else:
+                response_str = str(response_text).strip() if response_text else ""
+            
+            if not response_str:
+                # Timeout or empty response - default to NEW query
+                logger.warning("[FOLLOWUP] Empty LLM response, treating as new query")
+                return FollowUpContext(
+                    is_followup=False,
+                    followup_type=FollowUpType.NEW,
+                    confidence=0.0,
+                    previous_context=None,
+                    reasoning="LLM response timeout orEmpty response"
+                )
+            
+            # Extract JSON from response (handle markdown wrapping)
+            import json
+            json_match = re.search(r'\{.*\}', response_str, re.DOTALL)
+            if json_match:
+                classification = json.loads(json_match.group(0))
+            else:
+                # Fallback if JSON parsing fails
+                logger.warning(f"[FOLLOWUP] Could not parse LLM response: {response_str[:100]}")
+                classification = {
+                    "is_followup": False,
+                    "followup_type": "NEW",
+                    "confidence": 0.0,
+                    "reasoning": "LLM response parsing failed"
+                }
+            
+            is_followup = classification.get("is_followup", False)
+            followup_type_str = classification.get("followup_type", "NEW").upper()
+            confidence = float(classification.get("confidence", 0.0))
+            reasoning = classification.get("reasoning", "")
+            
+            # Map string to FollowUpType enum
+            try:
+                followup_type = FollowUpType[followup_type_str]
+            except KeyError:
+                followup_type = FollowUpType.NEW
+            
+            # If not a follow-up, return early
+            if not is_followup:
+                return FollowUpContext(
+                    is_followup=False,
+                    followup_type=followup_type,
+                    confidence=confidence,
+                    previous_context=None,
+                    reasoning=reasoning
+                )
+            
+            # STEP 3: Extract context from previous SQL for follow-up merging
+            previous_context = None
+            if previous_sql:
+                previous_context = self._extract_context_from_sql(
+                    query_text=previous_query,
+                    sql=previous_sql,
+                    result_count=previous_result_count
+                )
+                logger.info(f"[FOLLOWUP] Extracted context: table={previous_context.table_name}, "
+                           f"filters={len(previous_context.filters)}, result_count={previous_result_count}")
+            
+            logger.info(f"[FOLLOWUP] Detected follow-up: type={followup_type.value}, confidence={confidence:.0%}")
+            
+            return FollowUpContext(
+                is_followup=True,
+                followup_type=followup_type,
+                confidence=confidence,
+                previous_context=previous_context,
+                reasoning=reasoning
+            )
+            
+        except Exception as e:
+            logger.error(f"[FOLLOWUP] LLM analysis failed: {e}, defaulting to NEW query")
+            # Conservative fallback: treat as new query if LLM fails
+            return FollowUpContext(
+                is_followup=False,
+                followup_type=FollowUpType.NEW,
+                confidence=0.0,
+                previous_context=None,
+                reasoning=f"Follow-up detection failed: {str(e)}"
+            )
     
     def _extract_previous_query(self, conversation_history: str) -> Optional[str]:
         """Extract the previous user query from conversation history.
         
-        Returns the SECOND-TO-LAST USER: line, which is the actual previous query
+        Returns the SECOND-TO-LAST USER query, which is the actual previous query
         (not the current one which is already being analyzed).
+        
+        Updated to handle multiple conversation history formats:
+        - USER: format
+        - User: format 
+        - Direct query text
+        - Enhanced session format
         """
+        if not conversation_history:
+            return None
+            
         lines = conversation_history.split('\n')
         
-        # Find all USER: lines in reverse order
+        # Find all USER queries in various formats
         user_queries = []
         for line in reversed(lines):
-            if line.startswith('USER:'):
-                user_queries.append(line.replace('USER:', '').strip())
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Format 1: "USER:" or "User:" prefix
+            if line.startswith(('USER:', 'User:')):
+                query = line.split(':', 1)[1].strip()
+                if query:
+                    user_queries.append(query)
+            
+            # Format 2: Lines that look like questions (enhanced session format)
+            elif ('?' in line and len(line) > 10 and 
+                  not line.startswith(('SQL:', 'Results:', '[', 'INFO:', 'DEBUG:', 'WARNING:'))):
+                user_queries.append(line)
+            
+            # Format 3: Lines that contain common query keywords
+            elif any(keyword in line.lower() for keyword in ['how many', 'list', 'show', 'find', 'get', 'what', 'which']):
+                if not line.startswith(('SQL:', 'Results:', '[', 'INFO:', 'DEBUG:', 'WARNING:')):
+                    user_queries.append(line)
         
         # Return the second-to-last (index 1 gives us the previous query if there are at least 2)
         if len(user_queries) >= 2:
             return user_queries[1]  # Index 1 is the second element (previous query)
         elif len(user_queries) == 1:
-            # Only one query in history, it's the current one - no previous
-            return None
+            # ChatGPT-Level: One query in history means that's our previous query
+            return user_queries[0]
         
         return None
     
@@ -333,18 +510,9 @@ class FollowUpAnalyzer:
         if from_match:
             return from_match.group(1)
         
-        # Pattern 2: Look for plural nouns that might be table names
-        # Common table name patterns
-        if 'transactions' in query_lower or 'transaction' in query_lower:
-            return 'transactions'
-        elif 'customers' in query_lower or 'customer' in query_lower:
-            return 'customers'
-        elif 'orders' in query_lower or 'order' in query_lower:
-            return 'orders'
-        elif 'merchants' in query_lower or 'merchant' in query_lower:
-            return 'merchants'
-        
-        # Default - can't infer
+        # Pattern 2: Dynamic table detection using schema context
+        # NO HARDCODED TABLE NAMES - let calling code determine from context
+        # Return None to let calling code handle dynamically
         return None
     
     def _extract_filters_from_text(self, query: str) -> List[Dict[str, str]]:

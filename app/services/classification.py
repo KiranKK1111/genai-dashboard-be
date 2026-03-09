@@ -8,7 +8,9 @@ from typing import Optional, List
 
 from .. import llm, models
 from ..helpers import build_messages_with_token_management
+import logging
 
+logger = logging.getLogger(__name__)
 
 def extract_json_from_text(text: str) -> Optional[str]:
     """Extract JSON object from text, handling various formats.
@@ -106,7 +108,7 @@ async def classify_query(
             "Do not add quotes, don't add comments, don't add markdown. Just JSON.\n\n"
             "Examples:\n"
             '{"type":"file_query","reasoning":"User wants to analyze uploaded CSV file content","confidence":0.92}\n'
-            '{"type":"data_query","reasoning":"User asking about transactions despite file upload","confidence":0.87}\n'
+            '{"type":"data_query","reasoning":"User asking about database records despite file upload","confidence":0.87}\n'
         )
     else:
         # No files uploaded - let LLM understand intent from conversation
@@ -115,7 +117,7 @@ async def classify_query(
             "You MUST respond with ONLY valid JSON. Nothing else. No explanations. No extra text.\n"
             "If you respond with anything other than JSON, it is a CRITICAL FAILURE.\n\n"
             "Available intents:\n"
-            "1. 'data_query': User wants database data (show me, get me, retrieve, customers, transactions, tell me about)\n"
+            "1. 'data_query': User wants database data (show me, get me, retrieve, list records, find by id, etc.)\n"
             "2. 'file_query': User wants to upload and analyze files\n"
             "3. 'file_lookup': Follow-up about previously analyzed files\n"
             "4. 'config_update': Change visualization, layout, or display preferences\n"
@@ -124,7 +126,7 @@ async def classify_query(
             '{"type":"data_query","reasoning":"brief reason","confidence":0.0-1.0}\n'
             "Do not add quotes, don't add comments, don't add markdown. Just JSON.\n\n"
             "Examples:\n"
-            '{"type":"data_query","reasoning":"User asking for transaction details for specific customer","confidence":0.95}\n'
+            '{"type":"data_query","reasoning":"User asking to look up a specific record by id","confidence":0.95}\n'
             '{"type":"standard","reasoning":"User greeting","confidence":0.88}\n'
         )
     
@@ -215,10 +217,10 @@ async def classify_query(
         
         # First check if this is a follow-up question in conversation context
         if conversation_history or message_history:
-            # Check for follow-up keywords
-            followup_patterns = r'\b(is it|what about|how about|can you|show me|more|again|different|which|when|why|how much|credit|debit|direction|type)\b'
-            # Check if previous context mentioned data queries (transactions, customers, etc.)
-            data_context_patterns = r'\b(transaction|customer|merchant|account|order|payment|data result)\b'
+            # Use semantic follow-up detection instead of hardcoded patterns
+            from .semantic_followup_detector import SemanticFollowUpDetector
+            
+            detector = SemanticFollowUpDetector()
             
             history_context = conversation_history
             if message_history:
@@ -233,8 +235,17 @@ async def classify_query(
                             msg_texts.append(msg_text)
                 history_context = " ".join(msg_texts)
             
-            if re.search(followup_patterns, query, re.IGNORECASE) and re.search(data_context_patterns, history_context, re.IGNORECASE):
-                return "data_query", f"Follow-up pattern detection (LLM failed): {str(e)}", 0.65
+            # Semantic follow-up detection with confidence scoring
+            try:
+                is_followup, confidence, analysis = detector.detect_followup(query, history_context)
+                if is_followup and confidence > 0.6:
+                    return "data_query", f"Semantic follow-up detection (LLM failed): {analysis}", confidence
+            except Exception as semantic_e:
+                logger.warning(f"Semantic follow-up detection failed: {semantic_e}")
+                # Minimal fallback - simple linguistic indicators
+                simple_followup = any(word in query.lower() for word in ["those", "them", "these", "that", "previous"])
+                if simple_followup and len(history_context) > 10:
+                    return "data_query", f"Simple follow-up detection (all failed): {str(e)}", 0.5
         
         # Check for file_query patterns when files are uploaded
         if has_files:
@@ -243,7 +254,7 @@ async def classify_query(
                 return "file_query", f"Detected file analysis request. Processing file content for insights.", 0.75
         
         # Standard pattern-based classification if no follow-up context
-        keywords_data = r'\b(show|get|display|retrieve|customer|transaction|CUST|data)\b'
+        keywords_data = r'\b(show|get|display|retrieve|select|from|where|group|order|table|column|record|data)\b'
         if re.search(keywords_data, query, re.IGNORECASE):
             return "data_query", f"Pattern fallback (LLM failed): {str(e)}", 0.6
         return "standard", f"Classification failed: {str(e)}", 0.0

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import AsyncGenerator, Optional
 
+import anyio
+
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, AsyncConnection
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import text, event, inspect
@@ -126,6 +128,9 @@ async_session_factory = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
 )
 
+# Alias for compatibility with existing code
+SessionLocal = async_session_factory
+
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     """
@@ -135,8 +140,22 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
     bound to the event loop. The session is automatically closed after
     the request completes.
     """
-    async with async_session_factory() as session:
+    # NOTE: request cancellations (client disconnects/timeouts) can interrupt
+    # normal cleanup and cause noisy "Exception terminating connection" logs
+    # from the asyncpg dialect. We shield session close from cancellation so
+    # connections are returned/closed cleanly.
+    session: AsyncSession = async_session_factory()
+    try:
         yield session
+    finally:
+        with anyio.CancelScope(shield=True):
+            await session.close()
+
+
+async def dispose_engine() -> None:
+    """Dispose the global engine, shielding from cancellation."""
+    with anyio.CancelScope(shield=True):
+        await engine.dispose()
 
 
 async def init_db() -> None:

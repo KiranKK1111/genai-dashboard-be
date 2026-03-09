@@ -15,15 +15,15 @@ Example Usage:
     plan = QueryPlan(
         intent="data_query",
         select=SelectClause(fields=["t.*"]),
-        from_=FromClause(table="transactions", alias="t"),
+        from_=FromClause(table="<primary_table>", alias="t"),
         joins=[JoinClause(
             type="inner",
-            table="customers",
-            alias="c",
-            on=[BinaryCondition(left="t.customer_id", op="=", right="c.customer_id")]
+            table="<related_table>",
+            alias="r",
+            on=[BinaryCondition(left="t.related_id", op="=", right="r.id")]
         )],
-        where=[BinaryCondition(left="c.kyc_verified", op="=", right=Literal(value=True, type="bool"))],
-        order_by=[OrderByField(expr="t.txn_time", direction="desc")],
+        where=[BinaryCondition(left="r.is_verified", op="=", right=Literal(value=True, type="bool"))],
+        order_by=[OrderByField(expr="t.created_at", direction="desc")],
         limit=10
     )
     
@@ -64,14 +64,15 @@ class Literal:
     type: ValueType
     
     def to_dict(self) -> Dict[str, Any]:
-        return {"value": self.value, "type": self.type.value}
+        type_val = self.type.value if hasattr(self.type, 'value') else str(self.type)
+        return {"value": self.value, "type": type_val}
 
 
 @dataclass
 class ColumnRef:
     """Reference to a column (table.column or alias.column)."""
-    column: str  # "customer_id"
-    table: Optional[str] = None  # "customers" or "c"
+    column: str  # "column_name"
+    table: Optional[str] = None  # "table_name" or "alias"
     
     def to_dict(self) -> Dict[str, Any]:
         result = {"column": self.column}
@@ -152,7 +153,7 @@ Condition = Union[BinaryCondition, LogicalCondition, NotCondition]
 @dataclass
 class SelectClause:
     """SELECT clause specification."""
-    fields: List[str]  # ["t.*", "c.customer_id", "SUM(t.amount) as total"]
+    fields: List[str]  # ["t.*", "a.entity_id", "SUM(t.amount) as total"]
     distinct: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
@@ -169,7 +170,7 @@ class SelectClause:
 @dataclass
 class FromClause:
     """FROM clause specification."""
-    table: str  # "transactions"
+    table: str  # "table_name"
     alias: Optional[str] = None  # "t"
     
     def to_dict(self) -> Dict[str, Any]:
@@ -202,8 +203,8 @@ class JoinCondition:
 class JoinClause:
     """A single JOIN specification."""
     type: Literal["inner", "left", "right", "full", "cross"]
-    table: str  # "customers"
-    alias: Optional[str] = None  # "c"
+    table: str  # "related_table"
+    alias: Optional[str] = None  # "r"
     on: Optional[List[JoinCondition]] = None  # CROSS JOINs don't have ON
     
     def to_dict(self) -> Dict[str, Any]:
@@ -348,10 +349,10 @@ class QueryPlan:
 @dataclass
 class QueryArtifacts:
     """Metadata extracted from a validated QueryPlan."""
-    tables_used: List[str]  # ["transactions", "customers"]
-    columns_used: List[str]  # ["t.txn_id", "c.customer_id", ...]
+    tables_used: List[str]  # ["table1", "table2"]
+    columns_used: List[str]  # ["t.event_id", "a.entity_id", ...]
     joins_used: List[Dict[str, Any]]  # [{from: ..., to: ..., type: ...}]
-    where_conditions: List[str]  # ["c.kyc_verified = true", ...]
+    where_conditions: List[str]  # ["a.is_verified = true", ...]
     group_by_fields: List[str]
     having_conditions: List[str]
     order_by_fields: List[str]

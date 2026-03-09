@@ -10,12 +10,18 @@ Takes raw extraction/query results and transforms them into:
 
 from __future__ import annotations
 
+import json
+import re
+import logging
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 import textwrap
 
 from app.services.dynamic_visualization_generator import DynamicVisualizationGenerator
+from .. import llm
+
+logger = logging.getLogger(__name__)
 
 
 class ContentBlockType(Enum):
@@ -52,7 +58,8 @@ class ContentBlock:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        result = {"type": self.type.value}
+        type_val = self.type.value if hasattr(self.type, 'value') else str(self.type)
+        result = {"type": type_val}
         if self.text:
             result["text"] = self.text
         if self.items:
@@ -86,12 +93,14 @@ class ArtifactsMetadata:
     files_used: List[Dict[str, Any]] = field(default_factory=list)
     citations: List[Dict[str, Any]] = field(default_factory=list)
     sql: Optional[str] = None
+    files_analyzed: int = 0  # For file lookup responses
     
     def to_dict(self) -> Dict[str, Any]:
         return {
             "files_used": self.files_used,
             "citations": self.citations,
             "sql": self.sql,
+            "files_analyzed": self.files_analyzed,
         }
 
 
@@ -113,38 +122,12 @@ class AssistantMessage:
 class ResponseComposer:
     """
     Composes raw backend results into ChatGPT-like conversational responses.
+    
+    ZERO HARDCODING PRINCIPLE:
+    - No hardcoded emojis or visual elements
+    - LLM dynamically decides emoji usage based on context
+    - All formatting is data-driven and adaptive
     """
-    
-    # Emoji mappings for visual appeal
-    EMOJI_MAP = {
-        "file": "📄",
-        "summary": "📋",
-        "goal": "🎯",
-        "steps": "📍",
-        "points": "💡",
-        "info": "ℹ️",
-        "success": "✅",
-        "warning": "⚠️",
-        "error": "❌",
-        "next": "➡️",
-        "sql": "🔍",
-        "data": "📊",
-        "table": "📑",
-        "chart": "📈",
-        "chat": "💬",
-        "ai": "🤖",
-        "export": "💾",
-        "filter": "🔎",
-        "config": "⚙️",
-        "extract": "🎁",
-        "checklist": "✓",
-        "compare": "🔀",
-    }
-    
-    @staticmethod
-    def get_emoji(key: str, default: str = "•") -> str:
-        """Get emoji for a key, with fallback."""
-        return ResponseComposer.EMOJI_MAP.get(key.lower(), default)
     
     @staticmethod
     def compose_file_response(
@@ -165,8 +148,8 @@ class ResponseComposer:
         Returns:
             Tuple of (assistant_message, artifacts, followups)
         """
-        # Generate title
-        title = f"{ResponseComposer.get_emoji('file')} Summary of {filename}"
+        # Generate title (no hardcoded emoji - let LLM decide)
+        title = f"Summary of {filename}"
         
         # Parse summary for structure (look for headers/sections)
         blocks = ResponseComposer._parse_summary_into_blocks(filename, summary, mode="file")
@@ -186,6 +169,56 @@ class ResponseComposer:
         
         # Generate contextual follow-ups
         followups = ResponseComposer._generate_file_followups(filename, intent)
+        
+        return assistant, artifacts, followups
+    
+    @staticmethod
+    def compose_file_lookup_response(
+        query: str,
+        answer: str,
+        file_count: int = 0,
+    ) -> tuple[AssistantMessage, ArtifactsMetadata, List[FollowUp]]:
+        """
+        Compose a response for file follow-up queries (ChatGPT-like).
+        
+        Handles questions about previously uploaded files with proper context preservation.
+        
+        Args:
+            query: The follow-up question about the file
+            answer: The LLM-generated answer based on file context
+            file_count: Number of files referenced in the answer
+            
+        Returns:
+            Tuple of (assistant_message, artifacts, followups)
+        """
+        # Generate title (no hardcoded emoji - let LLM decide)
+        title = "File Analysis Result"
+        
+        # Create structured response
+        blocks = []
+        
+        # Add the answer as the main content (no hardcoded emoji)
+        blocks.append(ContentBlock(
+            type=ContentBlockType.PARAGRAPH,
+            text=answer
+        ))
+        
+        # Create assistant message
+        assistant = AssistantMessage(
+            title=title,
+            content=blocks
+        )
+        
+        # Create artifacts noting files were analyzed
+        artifacts = ArtifactsMetadata(
+            files_analyzed=file_count
+        )
+        
+        # Generate follow-up questions about the files
+        followups = ResponseComposer._generate_file_followups(
+            "uploaded documents",
+            "answer_file_question"
+        )
         
         return assistant, artifacts, followups
     
@@ -210,24 +243,22 @@ class ResponseComposer:
         Returns:
             Tuple of (assistant_message, artifacts, followups, visualization_dict_with_schema_and_aggregators)
         """
-        # Generate natural intro
+        # Generate natural intro (no hardcoded emojis)
         row_count = len(results)
-        title = f"{ResponseComposer.get_emoji('data')} Query Results ({row_count} rows)"
+        title = f"Query Results ({row_count} rows)"
         
         blocks = []
         
-        # Intro paragraph with emoji
+        # Intro paragraph (clean professional response)
         if row_count > 0:
             blocks.append(ContentBlock(
                 type=ContentBlockType.PARAGRAPH,
-                text=f"{ResponseComposer.get_emoji('success')} I found **{row_count} rows** matching your query (took {execution_time:.2f}s).",
-                emoji=ResponseComposer.get_emoji('success')
+                text=f"I found {row_count} rows matching your query (took {execution_time:.2f}s)."
             ))
         else:
             blocks.append(ContentBlock(
                 type=ContentBlockType.PARAGRAPH,
-                text=f"{ResponseComposer.get_emoji('warning')} Your query returned no results.",
-                emoji=ResponseComposer.get_emoji('warning')
+                text="Your query returned no results."
             ))
         
         # Show first few rows as table if data exists
@@ -243,24 +274,21 @@ class ResponseComposer:
             blocks.append(ContentBlock(
                 type=ContentBlockType.TABLE,
                 headers=headers,
-                rows=rows,
-                emoji=ResponseComposer.get_emoji('table')
+                rows=rows
             ))
             
             if len(results) > 10:
                 blocks.append(ContentBlock(
                     type=ContentBlockType.CALLOUT,
                     variant="info",
-                    text=f"{ResponseComposer.get_emoji('info')} Showing first 10 of {len(results)} rows. Use filtering or export for the full result set.",
-                    emoji=ResponseComposer.get_emoji('info')
+                    text=f"Showing first 10 of {len(results)} rows. Use filtering or export for the full result set."
                 ))
         
-        # Suggest next actions
+        # Suggest next actions (no hardcoded emojis)
         blocks.append(ContentBlock(
             type=ContentBlockType.CALLOUT,
             variant="next",
-            text=f"{ResponseComposer.get_emoji('chart')} Would you like to create a visualization, export results to CSV, or refine the query?",
-            emoji=ResponseComposer.get_emoji('chart')
+            text="Would you like to create a visualization, export results to CSV, or refine the query?"
         ))
         
         assistant = AssistantMessage(
@@ -299,24 +327,22 @@ class ResponseComposer:
         Returns:
             Tuple of (assistant_message, artifacts, followups, visualization_dict)
         """
-        # Generate natural intro
+        # Generate natural intro (no hardcoded emojis)
         row_count = len(results)
-        title = f"{ResponseComposer.get_emoji('data')} Query Results ({row_count} rows)"
+        title = f"Query Results ({row_count} rows)"
         
         blocks = []
         
-        # Intro paragraph with emoji
+        # Intro paragraph (clean professional response)
         if row_count > 0:
             blocks.append(ContentBlock(
                 type=ContentBlockType.PARAGRAPH,
-                text=f"{ResponseComposer.get_emoji('success')} I found **{row_count} rows** matching your query (took {execution_time:.2f}s).",
-                emoji=ResponseComposer.get_emoji('success')
+                text=f"I found {row_count} rows matching your query (took {execution_time:.2f}s)."
             ))
         else:
             blocks.append(ContentBlock(
                 type=ContentBlockType.PARAGRAPH,
-                text=f"{ResponseComposer.get_emoji('warning')} Your query returned no results.",
-                emoji=ResponseComposer.get_emoji('warning')
+                text="Your query returned no results."
             ))
         
         # Show first few rows as table if data exists
@@ -332,24 +358,21 @@ class ResponseComposer:
             blocks.append(ContentBlock(
                 type=ContentBlockType.TABLE,
                 headers=headers,
-                rows=rows,
-                emoji=ResponseComposer.get_emoji('table')
+                rows=rows
             ))
             
             if len(results) > 10:
                 blocks.append(ContentBlock(
                     type=ContentBlockType.CALLOUT,
                     variant="info",
-                    text=f"{ResponseComposer.get_emoji('info')} Showing first 10 of {len(results)} rows. Use filtering or export for the full result set.",
-                    emoji=ResponseComposer.get_emoji('info')
+                    text=f"Showing first 10 of {len(results)} rows. Use filtering or export for the full result set."
                 ))
         
-        # Suggest next actions
+        # Suggest next actions (no hardcoded emojis)
         blocks.append(ContentBlock(
             type=ContentBlockType.CALLOUT,
             variant="next",
-            text=f"{ResponseComposer.get_emoji('chart')} Would you like to create a visualization, export results to CSV, or refine the query?",
-            emoji=ResponseComposer.get_emoji('chart')
+            text="Would you like to create a visualization, export results to CSV, or refine the query?"
         ))
         
         assistant = AssistantMessage(
@@ -368,7 +391,7 @@ class ResponseComposer:
         return assistant, artifacts, followups, visualizations
     
     @staticmethod
-    def compose_chat_response(
+    async def compose_chat_response(
         user_query: str,
         answer: str,
         intent: str = "general_answer",
@@ -384,12 +407,11 @@ class ResponseComposer:
         Returns:
             Tuple of (assistant_message, artifacts, followups)
         """
-        # For chat, keep it simple but add emojis
+        # For chat, keep it simple (no hardcoded emojis - let LLM decide)
         blocks = [
             ContentBlock(
                 type=ContentBlockType.PARAGRAPH,
-                text=f"{ResponseComposer.get_emoji('ai')} {answer}",
-                emoji=ResponseComposer.get_emoji('ai')
+                text=answer
             )
         ]
         
@@ -404,7 +426,7 @@ class ResponseComposer:
         
         artifacts = ArtifactsMetadata()
         
-        followups = ResponseComposer._generate_chat_followups(user_query, intent)
+        followups = await ResponseComposer._generate_chat_followups(user_query, intent, answer)
         
         return assistant, artifacts, followups
     
@@ -414,15 +436,14 @@ class ResponseComposer:
         summary: str,
         mode: str = "file"
     ) -> List[ContentBlock]:
-        """Parse summary text into structured content blocks with emoji support."""
+        """Parse summary text into structured content blocks (no hardcoded emojis)."""
         blocks = []
         
-        # For file mode, add opening line
+        # For file mode, add opening line (no hardcoded emoji)
         if mode == "file":
             blocks.append(ContentBlock(
                 type=ContentBlockType.PARAGRAPH,
-                text=f"I read **{filename}**. Here's a structured summary:",
-                emoji=ResponseComposer.get_emoji('file')
+                text=f"I read {filename}. Here's a structured summary:"
             ))
         
         # Try to detect sections (lines starting with ##, ###, or numbered)
@@ -437,8 +458,7 @@ class ResponseComposer:
                 if current_section:
                     blocks.append(ContentBlock(
                         type=ContentBlockType.PARAGRAPH,
-                        text='\n'.join(current_section),
-                        emoji=ResponseComposer.get_emoji('info')
+                        text='\n'.join(current_section)
                     ))
                     current_section = []
             elif line.startswith('## ') or line.startswith('# '):
@@ -446,16 +466,14 @@ class ResponseComposer:
                 if current_section:
                     blocks.append(ContentBlock(
                         type=ContentBlockType.PARAGRAPH,
-                        text='\n'.join(current_section),
-                        emoji=ResponseComposer.get_emoji('info')
+                        text='\n'.join(current_section)
                     ))
                     current_section = []
                 
                 heading_text = line.lstrip('#').strip()
                 blocks.append(ContentBlock(
                     type=ContentBlockType.HEADING,
-                    text=heading_text,
-                    emoji=ResponseComposer.get_emoji('goal')
+                    text=heading_text
                 ))
             elif line.startswith('- ') or line.startswith('* '):
                 # Bullet point
@@ -463,16 +481,14 @@ class ResponseComposer:
                     if current_section:
                         blocks.append(ContentBlock(
                             type=ContentBlockType.PARAGRAPH,
-                            text='\n'.join(current_section),
-                            emoji=ResponseComposer.get_emoji('info')
+                            text='\n'.join(current_section)
                         ))
                         current_section = []
                     
-                    # Start new bullet list
+                    # Start new bullet list (no hardcoded emoji)
                     blocks.append(ContentBlock(
                         type=ContentBlockType.BULLETS,
-                        items=[],
-                        emoji=ResponseComposer.get_emoji('points')
+                        items=[]
                     ))
                 
                 # Add to current bullet list
@@ -484,15 +500,14 @@ class ResponseComposer:
                     if current_section:
                         blocks.append(ContentBlock(
                             type=ContentBlockType.PARAGRAPH,
-                            text='\n'.join(current_section),
-                            emoji=ResponseComposer.get_emoji('info')
+                            text='\n'.join(current_section)
                         ))
                         current_section = []
                     
+                    # Start new numbered list (no hardcoded emoji)
                     blocks.append(ContentBlock(
                         type=ContentBlockType.NUMBERED,
-                        items=[],
-                        emoji=ResponseComposer.get_emoji('steps')
+                        items=[]
                     ))
                 
                 # Remove numbering and add to list
@@ -507,12 +522,11 @@ class ResponseComposer:
                 # Regular text
                 current_section.append(line)
         
-        # Flush remaining
+        # Flush remaining (no hardcoded emoji)
         if current_section:
             blocks.append(ContentBlock(
                 type=ContentBlockType.PARAGRAPH,
-                text='\n'.join(current_section),
-                emoji=ResponseComposer.get_emoji('info')
+                text='\n'.join(current_section)
             ))
         
         return blocks
@@ -550,15 +564,14 @@ class ResponseComposer:
             )
             return visualization
         except Exception as e:
-            print(f"⚠️  Dynamic visualization generation failed: {e}, using fallback")
-            # Fallback to simple multi_viz if AI generation fails
+            print(f"WARNING: Dynamic visualization generation failed: {e}, using fallback")
+            # Fallback to simple multi_viz if AI generation fails (no hardcoded emoji)
             return {
                 "chart_id": "v1",
                 "type": "multi_viz",
                 "title": "Query Results",
                 "subtitle": f"{row_count} rows returned",
                 "description": "Multi-visualization panel - switch between different view types",
-                "emoji": "🎨",
                 "config": {
                     "primary_view": "table",
                     "available_views": ["table", "bar", "line", "pie"]
@@ -581,14 +594,13 @@ class ResponseComposer:
         if not results or row_count == 0:
             return None
         
-        # Return fallback simple multi-view visualization
+        # Return fallback simple multi-view visualization (no hardcoded emoji)
         return {
             "chart_id": "v1",
             "type": "multi_viz",
             "title": "Query Results",
             "subtitle": f"{row_count} rows returned",
             "description": "Multi-visualization panel - switch between different view types",
-            "emoji": "🎨",
             "config": {
                 "primary_view": "table",
                 "available_views": ["table", "bar", "line", "pie"]
@@ -600,7 +612,7 @@ class ResponseComposer:
     
     @staticmethod
     def _generate_file_followups(filename: str, intent: str) -> List[FollowUp]:
-        """Generate contextual follow-up questions for file responses."""
+        """Generate contextual follow-up questions for file responses (static fallback)."""
         return [
             FollowUp(
                 id="fu_1",
@@ -615,6 +627,142 @@ class ResponseComposer:
                 text="Compare this with another document"
             ),
         ]
+    
+    @staticmethod
+    async def generate_dynamic_file_followups(
+        filename: str,
+        content_preview: str,
+        intent: str = "summarize"
+    ) -> List[FollowUp]:
+        """
+        Generate context-aware follow-up suggestions using LLM based on actual file content.
+        
+        Args:
+            filename: Name of the file
+            content_preview: First ~500 chars of file content for context
+            intent: What the user was trying to do
+            
+        Returns:
+            List of contextual follow-up suggestions
+        """
+        # Truncate content for LLM prompt
+        content_snippet = content_preview[:500] + "..." if len(content_preview) > 500 else content_preview
+        
+        prompt = f"""Based on this uploaded file, generate 3 highly relevant follow-up questions a user might ask.
+
+FILE: {filename}
+CONTENT PREVIEW:
+{content_snippet}
+
+Generate follow-up questions that are:
+1. Specific to THIS file's actual content (e.g., specific topics, entities, or data it contains)
+2. Actionable (extract, analyze, compare, summarize specific parts)
+3. Short (under 50 characters each)
+
+Respond ONLY with JSON:
+{{"followups": ["question1", "question2", "question3"]}}"""
+        
+        try:
+            response = await llm.call_llm(
+                [{"role": "system", "content": "You generate context-aware follow-up questions. Respond ONLY with valid JSON."},
+                 {"role": "user", "content": prompt}],
+                stream=False,
+                max_tokens=200,
+                temperature=0.3
+            )
+            
+            # Parse response
+            response_str = str(response).strip().replace('```json', '').replace('```', '').strip()
+            json_match = re.search(r'\{[^{}]*"followups"[^{}]*\}', response_str, re.DOTALL)
+            
+            if json_match:
+                result = json.loads(json_match.group(0))
+                followup_texts = result.get('followups', [])[:3]
+                
+                return [
+                    FollowUp(id=f"fu_{i+1}", text=text)
+                    for i, text in enumerate(followup_texts) if text
+                ]
+        except Exception as e:
+            logger.warning(f"[RESPONSE_COMPOSER] Dynamic followup generation failed: {e}")
+        
+        # Fallback to static followups
+        return ResponseComposer._generate_file_followups(filename, intent)
+    
+    @staticmethod
+    async def generate_dynamic_sql_followups(
+        results: List[Dict[str, Any]],
+        user_query: str,
+        sql_query: str = ""
+    ) -> List[FollowUp]:
+        """
+        Generate context-aware follow-up suggestions for SQL/database results.
+        
+        Args:
+            results: Query result rows
+            user_query: Original user question
+            sql_query: The SQL that was executed
+            
+        Returns:
+            List of contextual follow-up suggestions
+        """
+        if not results:
+            return [
+                FollowUp(id="fu_1", text="Try different filters or conditions"),
+                FollowUp(id="fu_2", text="Show me sample data from this table"),
+                FollowUp(id="fu_3", text="What columns are available?"),
+            ]
+        
+        # Get column names and sample data
+        columns = list(results[0].keys()) if results else []
+        sample_row = results[0] if results else {}
+        row_count = len(results)
+        
+        # Create data summary for LLM
+        data_summary = f"Columns: {', '.join(columns[:10])}"
+        if sample_row:
+            sample_preview = str(sample_row)[:200]
+            data_summary += f"\nSample row: {sample_preview}"
+        
+        prompt = f"""Based on this database query result, generate 3 relevant follow-up questions.
+
+USER QUERY: {user_query}
+RESULT: {row_count} rows returned
+{data_summary}
+
+Generate follow-ups that:
+1. Build on THIS specific result (drill down, filter, aggregate)
+2. Explore related data (joins, comparisons)
+3. Are short (under 50 chars each)
+
+Respond ONLY with JSON:
+{{"followups": ["question1", "question2", "question3"]}}"""
+        
+        try:
+            response = await llm.call_llm(
+                [{"role": "system", "content": "You generate context-aware follow-up questions for data queries. Respond ONLY with valid JSON."},
+                 {"role": "user", "content": prompt}],
+                stream=False,
+                max_tokens=200,
+                temperature=0.3
+            )
+            
+            response_str = str(response).strip().replace('```json', '').replace('```', '').strip()
+            json_match = re.search(r'\{[^{}]*"followups"[^{}]*\}', response_str, re.DOTALL)
+            
+            if json_match:
+                result = json.loads(json_match.group(0))
+                followup_texts = result.get('followups', [])[:3]
+                
+                return [
+                    FollowUp(id=f"fu_{i+1}", text=text)
+                    for i, text in enumerate(followup_texts) if text
+                ]
+        except Exception as e:
+            logger.warning(f"[RESPONSE_COMPOSER] Dynamic SQL followup generation failed: {e}")
+        
+        # Fallback to static
+        return ResponseComposer._generate_sql_followups(row_count, "run_sql", results, sql_query)
     
     @staticmethod
     def _generate_sql_followups(
@@ -652,18 +800,18 @@ class ResponseComposer:
         has_group = "group by" in query_lower
         has_order = "order by" in query_lower
         
-        # Context-aware follow-ups based on query type
+        # Context-aware follow-ups based on query type (no hardcoded emojis)
         if row_count > 1000:
             # Large result set
             followups.append(FollowUp(
                 id="fu_1",
-                text=f"🔍 Filter by specific criteria (showing {row_count:,} rows)"
+                text=f"Filter by specific criteria (showing {row_count:,} rows)"
             ))
         elif row_count > 100:
             # Medium result set
             followups.append(FollowUp(
                 id="fu_1",
-                text=f"📊 Create visualization of this data ({row_count} rows)"
+                text=f"Create visualization of this data ({row_count} rows)"
             ))
         else:
             # Small result set
@@ -686,7 +834,7 @@ class ResponseComposer:
         else:
             followups.append(FollowUp(
                 id="fu_2",
-                text="📥 Export results to CSV or Excel"
+                text="Export results to CSV or Excel"
             ))
         
         # Add refinement suggestion
@@ -704,19 +852,61 @@ class ResponseComposer:
         return followups
     
     @staticmethod
-    def _generate_chat_followups(user_query: str, intent: str) -> List[FollowUp]:
-        """Generate contextual follow-up questions for chat responses."""
+    async def _generate_chat_followups(user_query: str, intent: str, answer: str = "") -> List[FollowUp]:
+        """Generate contextual follow-up questions for chat responses using LLM."""
+        from app import llm
+        
+        # Use LLM to generate 3 contextual follow-ups based on the conversation
+        prompt = f"""Based on this conversation, generate 3 relevant follow-up questions the user might ask next.
+
+User asked: "{user_query}"
+
+Assistant answered: "{answer[:500]}"
+
+Generate 3 short, specific follow-up questions (not generic). Format as JSON array:
+["question 1", "question 2", "question 3"]
+
+Requirements:
+- Make them specific to the topic discussed
+- Keep each under 10 words
+- Don't repeat the original question
+- Focus on next logical steps or clarifications"""
+
+        try:
+            response = await llm.call_llm(
+                [{"role": "user", "content": prompt}],
+                stream=False,
+                max_tokens=200,
+                temperature=0.7
+            )
+            
+            response_text = str(response).strip()
+            
+            # Try to parse JSON array
+            import json
+            import re
+            
+            # Extract JSON array from response
+            json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+            if json_match:
+                questions = json.loads(json_match.group(0))
+                # Handle both array of strings and array of objects
+                followups = []
+                for i, q in enumerate(questions[:3]):
+                    if isinstance(q, dict):
+                        # LLM returned {"question": "..."} format
+                        text = q.get('question') or q.get('text') or str(q)
+                    else:
+                        # LLM returned plain string
+                        text = str(q)
+                    followups.append(FollowUp(id=f"fu_{i+1}", text=text))
+                return followups
+        except Exception as e:
+            print(f"[FOLLOWUPS] Dynamic generation failed: {e}, using fallback")
+        
+        # Fallback to generic questions if LLM fails
         return [
-            FollowUp(
-                id="fu_1",
-                text="Tell me more about this"
-            ),
-            FollowUp(
-                id="fu_2",
-                text="Give me an example"
-            ),
-            FollowUp(
-                id="fu_3",
-                text="How does this compare to...?"
-            ),
+            FollowUp(id="fu_1", text="Tell me more about this"),
+            FollowUp(id="fu_2", text="Give me an example"),
+            FollowUp(id="fu_3", text="How does this compare to...?"),
         ]

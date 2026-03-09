@@ -180,7 +180,8 @@ class PostgreSQLGenerator(SQLGenerator):
             if value.type == "string":
                 return f"'{value.value}'"
             elif value.type == "bool":
-                return self.boolean_literal(value.value)
+                bool_val = value.value if isinstance(value.value, bool) else (str(value.value).lower() == 'true')
+                return self.boolean_literal(bool_val)
             elif value.type == "null":
                 return "NULL"
             else:

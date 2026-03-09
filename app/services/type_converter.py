@@ -150,8 +150,8 @@ class DynamicTypeConverter:
         Convert SQL to fix type mismatches based on actual schema.
         
         Example:
-            Input:  SELECT * FROM customers WHERE kyc_verified = 1
-            Output: SELECT * FROM customers WHERE kyc_verified = true
+            Input:  SELECT * FROM <table> WHERE <bool_col> = 1
+            Output: SELECT * FROM <table> WHERE <bool_col> = true
         
         Works by:
         1. Extracting table names from SQL

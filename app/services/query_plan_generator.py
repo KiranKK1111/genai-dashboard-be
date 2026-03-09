@@ -65,6 +65,24 @@ class OrderDirection(str, Enum):
     DESC = "DESC"
 
 
+class RightKind(str, Enum):
+    """Type of right-hand side in a condition."""
+    LITERAL = "literal"        # "AP", 100, True
+    LIST = "list"              # ["AP","TS"]
+    RANGE = "range"            # ["2024-01-01","2024-12-31"]
+    COLUMN = "column"          # other_col reference
+    SUBQUERY = "subquery"      # "SELECT ..."
+    RAW = "raw"                # "NOW()", "DATE_TRUNC(...)"
+
+
+class SetOpType(str, Enum):
+    """Set operation types."""
+    UNION = "UNION"
+    UNION_ALL = "UNION ALL"
+    INTERSECT = "INTERSECT"
+    EXCEPT = "EXCEPT"
+
+
 class ColumnSelectionIntent(str, Enum):
     """Semantic intent for column selection - determined by LLM analysis."""
     ALL_COLUMNS = "all_columns"  # User wants all columns (SELECT *)
@@ -121,9 +139,10 @@ class AggregateField:
 class WhereCondition:
     """Single WHERE condition."""
     left: str  # column name or expression
-    operator: str  # =, <, >, LIKE, IN, BETWEEN, etc.
-    right: Any  # value or list of values
-    is_literal: bool = True  # True: value should be quoted; False: column reference
+    operator: str  # =, <, >, LIKE, IN, BETWEEN, EXISTS, IS NULL, etc.
+    right: Any = None  # value, list of values, subquery, or range
+    right_kind: RightKind = RightKind.LITERAL  # Type of right-hand side
+    is_literal: bool = True  # Legacy field (deprecated - use right_kind instead)
 
 
 @dataclass
@@ -144,6 +163,7 @@ class QueryPlan:
     # SELECT clause
     select_expressions: List[str] = field(default_factory=list)  # column names or expressions
     select_aggregates: List[AggregateField] = field(default_factory=list)  # sum(x), count(*), etc.
+    distinct: bool = False  # SELECT DISTINCT
     
     # FROM clause
     from_table: str = ""
@@ -164,6 +184,22 @@ class QueryPlan:
     
     # ORDER BY
     order_by: List[OrderByField] = field(default_factory=list)
+    
+    # PAGINATION
+    limit: Optional[int] = None  # LIMIT clause
+    offset: Optional[int] = None  # OFFSET clause
+    
+    # WINDOW FUNCTIONS (optional - can also be in select_expressions)
+    window_expressions: List[str] = field(default_factory=list)  # ROW_NUMBER(), RANK(), etc.
+    
+    # CTEs and SET OPERATIONS (composable for future expansion)
+    ctes: List[Dict[str, Any]] = field(default_factory=list)  # [{"name": "...", "sql": "..."}]
+    set_op: Optional[Dict[str, Any]] = None  # {"type": "UNION", "right_sql": "..."}
+    
+    # CLARIFICATION FIELDS (LLM-driven)
+    clarification_needed: bool = False  # Does LLM need user input?
+    clarification_question: Optional[str] = None  # The question to ask
+    clarification_options: List[str] = field(default_factory=list)  # Multiple choice options
     
     # SEMANTIC ANALYSIS - Column Selection Intent (LLM-determined, not hardcoded)
     column_selection: Optional[ColumnSelectionAnalysis] = None
@@ -244,10 +280,11 @@ class QueryPlanRenderer:
         group_by_part = self._render_group_by(plan)
         having_part = self._render_having(plan)
         order_by_part = self._render_order_by(plan)
+        limit_offset_part = self._render_limit_offset(plan)
         
         # Combine parts
         sql_parts = [select_part, from_part, join_part, where_part, 
-                     group_by_part, having_part, order_by_part]
+                     group_by_part, having_part, order_by_part, limit_offset_part]
         sql = " ".join(part for part in sql_parts if part)
         
         # Add terminating semicolon
@@ -261,15 +298,18 @@ class QueryPlanRenderer:
         # Use the alias already generated in render() method
         from_alias = self.alias_map.get(plan.from_table, plan.from_alias or generate_random_alias(plan.from_table))
         
+        # Build SELECT keyword with optional DISTINCT
+        select_keyword = "SELECT DISTINCT" if plan.distinct else "SELECT"
+        
         # CRITICAL FIX: Respect column_selection intent from LLM analysis
         # If LLM determined user wants ALL_COLUMNS, use SELECT * (or alias.*)
         if plan.column_selection and plan.column_selection.intent == ColumnSelectionIntent.ALL_COLUMNS and not plan.select_aggregates:
             logger.info(f"[RENDER-SELECT] Respecting LLM intent ALL_COLUMNS (confidence={plan.column_selection.confidence})")
-            return f"SELECT {from_alias}.*"
+            return f"{select_keyword} {from_alias}.*"
         
         # If no specific columns and no aggregates, use SELECT alias.* to get all columns
         if not plan.select_expressions and not plan.select_aggregates:
-            return f"SELECT {from_alias}.*"
+            return f"{select_keyword} {from_alias}.*"
         
         # Columns - qualify with table alias when JOINs exist to avoid ambiguous refs
         cols = []
@@ -289,16 +329,18 @@ class QueryPlanRenderer:
                     agg_col = f"{from_alias}.{agg.column}"
                 else:
                     agg_col = agg.column
-                agg_expr = f"{agg.function.value}({self._quote_identifier(agg_col)})"
+                func_val = agg.function.value if hasattr(agg.function, 'value') else str(agg.function)
+                agg_expr = f"{func_val}({self._quote_identifier(agg_col)})"
             else:
-                agg_expr = f"{agg.function.value}(*)"
+                func_val = agg.function.value if hasattr(agg.function, 'value') else str(agg.function)
+                agg_expr = f"{func_val}(*)"
             
             if agg.alias:
                 agg_expr += f" AS {self._quote_identifier(agg.alias)}"
             
             cols.append(agg_expr)
         
-        select = "SELECT " + ", ".join(cols)
+        select = f"{select_keyword} " + ", ".join(cols)
         return select
     
     def _render_from(self, plan: QueryPlan) -> str:
@@ -332,7 +374,7 @@ class QueryPlanRenderer:
         join_parts = []
         
         for idx, join in enumerate(plan.joins):
-            join_type = join.join_type.value
+            join_type_val = join.join_type.value if hasattr(join.join_type, 'value') else str(join.join_type)
             right_table_name = join.full_table_name
             
             # Add schema prefix to join table if missing (use config schema, not hardcoded)
@@ -403,7 +445,7 @@ class QueryPlanRenderer:
                 on_clause = "TRUE"
             
             # Don't quote bare table alias - only quote schema-qualified table names
-            join_parts.append(f"{join_type} JOIN {right_table} AS {join_alias} ON {on_clause}")
+            join_parts.append(f"{join_type_val} JOIN {right_table} AS {join_alias} ON {on_clause}")
         
         return " ".join(join_parts)
     
@@ -421,7 +463,7 @@ class QueryPlanRenderer:
             join_alias: The alias for JOIN table (e.g., 'd')
             
         Returns:
-            ON clause string using aliases (e.g., "c.customer_id = d.customer_id") or None
+            ON clause string using aliases (e.g., "a.entity_id = b.entity_id") or None
         """
         # If no FK detection available, return None 
         if not self.join_graph_builder:
@@ -481,7 +523,7 @@ class QueryPlanRenderer:
         """
         Resolve table-qualified column references to use aliases.
         
-        E.g., 'cards.card_status' → 't_abc123.card_status'
+        E.g., 'table_name.column_name' → 't_abc123.column_name'
         
         Args:
             column_ref: Column reference (may be table.column or just column)
@@ -504,20 +546,110 @@ class QueryPlanRenderer:
         return column_ref
     
     def _render_where(self, plan: QueryPlan) -> str:
-        """Render WHERE clause with proper alias resolution."""
+        """
+        Render WHERE clause with support for advanced operators.
+        Handles BETWEEN, EXISTS, IN-subquery, IS NULL, LIKE, etc. dynamically.
+        """
         if not plan.where_conditions:
             return ""
         
         conditions = []
         for cond in plan.where_conditions:
-            # Resolve column reference to use aliases if it's table-qualified
-            column_ref = self._resolve_column_with_alias(cond.left)
-            left = self._quote_identifier(column_ref)
-            value = self._escape_value(cond.right, cond.is_literal)
-            conditions.append(f"{left} {cond.operator} {value}")
+            rendered = self._render_condition(cond, plan)
+            if rendered:
+                conditions.append(rendered)
+        
+        if not conditions:
+            return ""
         
         where_clause = "WHERE " + " AND ".join(conditions)
         return where_clause
+    
+    def _render_condition(self, cond: WhereCondition, plan: QueryPlan) -> str:
+        """
+        Dynamically render a single condition based on operator and right_kind.
+        This is the core dynamic rendering logic (completely composable).
+        
+        Args:
+            cond: WhereCondition to render
+            plan: QueryPlan (for alias resolution)
+            
+        Returns:
+            Rendered condition string
+        """
+        left = self._resolve_column_with_alias(cond.left)
+        left = self._quote_identifier(left)
+        op = cond.operator.upper()
+        right_kind = cond.right_kind
+        
+        # CASE 1: IS NULL / IS NOT NULL (no right operand needed)
+        if op in ("IS NULL", "IS NOT NULL"):
+            return f"{left} {op}"
+        
+        # CASE 2: BETWEEN with range
+        if op == "BETWEEN" and right_kind == RightKind.RANGE:
+            if isinstance(cond.right, (list, tuple)) and len(cond.right) >= 2:
+                a = self._escape_value(cond.right[0], True)
+                b = self._escape_value(cond.right[1], True)
+                return f"{left} BETWEEN {a} AND {b}"
+            else:
+                logger.warning(f"BETWEEN operator missing range values: {cond.right}")
+                return ""
+        
+        # CASE 3: EXISTS with subquery
+        if op == "EXISTS":
+            subquery = str(cond.right).strip()
+            # Subquery should be wrapped in parentheses
+            if not subquery.startswith("("):
+                subquery = f"({subquery})"
+            return f"EXISTS {subquery}"
+        
+        # CASE 4: IN with list of literals
+        if op == "IN" and right_kind == RightKind.LIST:
+            if isinstance(cond.right, (list, tuple)):
+                escaped_values = [self._escape_value(v, True) for v in cond.right]
+                value_list = "(" + ", ".join(escaped_values) + ")"
+                return f"{left} IN {value_list}"
+            else:
+                logger.warning(f"IN operator missing list: {cond.right}")
+                return ""
+        
+        # CASE 5: IN with subquery
+        if op == "IN" and right_kind == RightKind.SUBQUERY:
+            subquery = str(cond.right).strip()
+            if not subquery.startswith("("):
+                subquery = f"({subquery})"
+            return f"{left} IN {subquery}"
+        
+        # CASE 6: NOT IN with list
+        if op == "NOT IN" and right_kind == RightKind.LIST:
+            if isinstance(cond.right, (list, tuple)):
+                escaped_values = [self._escape_value(v, True) for v in cond.right]
+                value_list = "(" + ", ".join(escaped_values) + ")"
+                return f"{left} NOT IN {value_list}"
+            else:
+                return ""
+        
+        # CASE 7: NOT IN with subquery
+        if op == "NOT IN" and right_kind == RightKind.SUBQUERY:
+            subquery = str(cond.right).strip()
+            if not subquery.startswith("("):
+                subquery = f"({subquery})"
+            return f"{left} NOT IN {subquery}"
+        
+        # CASE 8: Column reference
+        if right_kind == RightKind.COLUMN:
+            right_col = self._resolve_column_with_alias(str(cond.right))
+            right = self._quote_identifier(right_col)
+            return f"{left} {op} {right}"
+        
+        # CASE 9: Raw expression (function calls, etc.)
+        if right_kind == RightKind.RAW:
+            return f"{left} {op} {cond.right}"
+        
+        # DEFAULT: Literal value
+        value = self._escape_value(cond.right, True)
+        return f"{left} {op} {value}"
     
     def _render_group_by(self, plan: QueryPlan) -> str:
         """Render GROUP BY clause with proper alias resolution."""
@@ -532,20 +664,83 @@ class QueryPlanRenderer:
         return "GROUP BY " + ", ".join(cols)
     
     def _render_having(self, plan: QueryPlan) -> str:
-        """Render HAVING clause with proper alias resolution."""
+        """Render HAVING clause with proper alias resolution and dynamic condition rendering."""
         if not plan.having_conditions:
             return ""
         
         conditions = []
         for cond in plan.having_conditions:
-            # Resolve column reference to use aliases if table-qualified
-            column_ref = self._resolve_column_with_alias(cond.left)
-            left = self._quote_identifier(column_ref)
-            value = self._escape_value(cond.right, cond.is_literal)
-            conditions.append(f"{left} {cond.operator} {value}")
+            # For HAVING clauses with aggregate functions, handle specially
+            rendered = self._render_having_condition(cond, plan)
+            if rendered:
+                conditions.append(rendered)
+        
+        if not conditions:
+            return ""
         
         having_clause = "HAVING " + " AND ".join(conditions)
         return having_clause
+    
+    def _render_having_condition(self, cond: WhereCondition, plan: QueryPlan) -> str:
+        """
+        Render HAVING condition with special handling for aggregate functions.
+        
+        For expressions like COUNT(table_name.id) > 10, we need to:
+        1. Resolve table aliases in the column reference
+        2. NOT quote the entire aggregate function call
+        """
+        left = cond.left.strip()
+        op = cond.operator.upper()
+        right_kind = cond.right_kind
+        
+        # Check if left side is an aggregate function (COUNT, SUM, AVG, MIN, MAX)
+        is_aggregate = any(func in left.upper() for func in ["COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "STDDEV("])
+        
+        if is_aggregate:
+            # For aggregates, resolve column aliases within the function call
+            # Example: COUNT(table_name.id) → COUNT(t_abc.id)
+            left = self._resolve_column_with_alias(left)
+            # Don't quote the entire function - instead quote only column references inside
+            # This is handled by _resolve_column_with_alias already
+        else:
+            # For non-aggregates, use normal column quoting
+            left = self._resolve_column_with_alias(left)
+            left = self._quote_identifier(left)
+        
+        # CASE 1: IS NULL / IS NOT NULL (no right operand needed)
+        if op in ("IS NULL", "IS NOT NULL"):
+            return f"{left} {op}"
+        
+        # CASE 2: BETWEEN with range
+        if op == "BETWEEN" and right_kind == RightKind.RANGE:
+            if isinstance(cond.right, (list, tuple)) and len(cond.right) >= 2:
+                a = self._escape_value(cond.right[0], True)
+                b = self._escape_value(cond.right[1], True)
+                return f"{left} BETWEEN {a} AND {b}"
+            else:
+                logger.warning(f"BETWEEN operator missing range values: {cond.right}")
+                return ""
+        
+        # CASE 3: EXISTS with subquery
+        if op == "EXISTS":
+            subquery = str(cond.right).strip()
+            if not subquery.startswith("("):
+                subquery = f"({subquery})"
+            return f"EXISTS {subquery}"
+        
+        # CASE 4: IN with list of literals
+        if op == "IN" and right_kind == RightKind.LIST:
+            if isinstance(cond.right, (list, tuple)):
+                escaped_values = [self._escape_value(v, True) for v in cond.right]
+                value_list = "(" + ", ".join(escaped_values) + ")"
+                return f"{left} IN {value_list}"
+            else:
+                logger.warning(f"IN operator missing list: {cond.right}")
+                return ""
+        
+        # DEFAULT: Literal value comparison (most common for HAVING)
+        value = self._escape_value(cond.right, True)
+        return f"{left} {op} {value}"
     
     def _render_order_by(self, plan: QueryPlan) -> str:
         """Render ORDER BY clause with proper alias resolution."""
@@ -557,10 +752,50 @@ class QueryPlanRenderer:
             # Resolve column reference to use aliases if table-qualified
             resolved_col = self._resolve_column_with_alias(field.column)
             col = self._quote_identifier(resolved_col)
-            direction = field.direction.value
-            fields.append(f"{col} {direction}")
+            direction_val = field.direction.value if hasattr(field.direction, 'value') else str(field.direction)
+            fields.append(f"{col} {direction_val}")
         
         return "ORDER BY " + ", ".join(fields)
+    
+    def _render_limit_offset(self, plan: QueryPlan) -> str:
+        """
+        Render LIMIT and OFFSET clauses.
+        Dialect-aware: handles different SQL dialects (PostgreSQL, MySQL, SQL Server, SQLite).
+        """
+        parts = []
+        
+        if plan.limit is not None:
+            limit_val = int(plan.limit)
+            if self.dialect == "mssql":
+                # SQL Server uses OFFSET ... ROWS FETCH NEXT ... ROWS ONLY
+                # This gets handled specially in the main render() if both limit and offset exist
+                if plan.offset is not None:
+                    # Will be handled as special case below
+                    pass
+                else:
+                    # Just LIMIT (TOP in SQL Server) - but OFFSET/FETCH is the modern way
+                    parts.append(f"OFFSET 0 ROWS FETCH NEXT {limit_val} ROWS ONLY")
+            else:
+                # PostgreSQL, MySQL, SQLite use LIMIT syntax
+                parts.append(f"LIMIT {limit_val}")
+        
+        if plan.offset is not None:
+            offset_val = int(plan.offset)
+            if self.dialect == "mssql":
+                # SQL Server: OFFSET ... ROWS FETCH NEXT ... ROWS ONLY
+                if plan.limit is not None:
+                    # Replace the LIMIT clause we just added
+                    parts = []
+                    parts.append(f"OFFSET {offset_val} ROWS FETCH NEXT {int(plan.limit)} ROWS ONLY")
+                else:
+                    # Just OFFSET
+                    parts = []
+                    parts.append(f"OFFSET {offset_val} ROWS")
+            else:
+                # PostgreSQL, MySQL, SQLite
+                parts.append(f"OFFSET {offset_val}")
+        
+        return " ".join(parts)
     
     def _get_default_schema(self) -> str:
         """Get default schema from config based on DB type - ZERO HARDCODING."""
@@ -793,7 +1028,7 @@ class QueryPlanGenerator:
         
         Generate a structured query plan from natural language using LLM.
         1. LLM outputs QueryPlan JSON (structured, not raw SQL)
-        2. Validator enforces semantic coverage rules (if query mentions "credit" and "cards" table is available, plan must include it)
+        2. Validator enforces semantic coverage rules (if query explicitly references a table/entity and it is available, plan must include it)
         3. If validation fails, regenerate with stronger guidance
         
         Args:
@@ -904,10 +1139,11 @@ class QueryPlanGenerator:
             QueryPlan or None if generation fails
         """
         # Extract real table/column names from schema to use in example
-        example_table = available_tables[0] if available_tables else "customers"
+        example_table = available_tables[0] if available_tables else "table_name"
         example_columns = available_columns_per_table.get(example_table, [])[:2] if available_columns_per_table else []
         if not example_columns:
             example_columns = ["id", "name"]
+        example_metric_column = example_columns[0] if example_columns else "id"
         
         regeneration_guidance = ""
         if regeneration_hint:
@@ -915,32 +1151,125 @@ class QueryPlanGenerator:
         
         llm_prompt = f"""RESPOND WITH ONLY THIS JSON STRUCTURE. NO OTHER TEXT. NO EXPLANATIONS.
 
-EXAMPLE (using REAL table/column names from schema below):
+You are generating a DATABASE-AGNOSTIC QUERY PLAN that supports:
+- Single-table queries: DISTINCT, filters, aggregations, pagination, sorting
+- Multi-table queries: JOINs (INNER/LEFT/RIGHT/FULL), aggregations across joins, EXISTS/NOT EXISTS
+- Complex operators: BETWEEN, IN (literal/subquery), LIKE/ILIKE, IS NULL, EXISTS
+
+⚠️ CRITICAL: ONLY include query features that the USER explicitly requests:
+- If user says "get all X" → NO joins, NO aggregations, NO filters. Use SELECT * 
+- If user says "count X" → use COUNT aggregate
+- If user mentions "where/filter/specific" → add WHERE conditions
+- If user asks for multiple tables → use JOINs
+- DO NOT add features the user didn't ask for - NO HALLUCINATING
+
+EXAMPLE 1 - Simple "Get all" query (most common):
+User: "get all {example_table}"
+Output:
 {{
-  "select_expressions": {example_columns},
-  "from_table": "{example_table}",
-  "where_conditions": [
-    {{
-      "column": "cards.card_status",
-      "operator": "=",
-      "value": "ACTIVE",
-      "is_literal": true
-    }}
+  "distinct": false,
+  "select_expressions": ["*"],
+  "select_aggregates": [],
+    "from_table": "{example_table}",
+  "joins": [],
+  "where_conditions": [],
+  "group_by": [],
+  "having_conditions": [],
+  "order_by": [],
+  "limit": null,
+  "offset": 0,
+  "clarification_needed": false,
+  "clarification_question": null,
+  "clarification_options": []
+}}
+
+EXAMPLE 1.5 - SUPERLATIVE QUERY (highest, lowest, top, most, least):
+User: "which {example_table} has the highest {example_metric_column}" / "top {example_table}"
+Output:
+{{
+  "distinct": false,
+  "select_expressions": ["*"],
+  "select_aggregates": [],
+    "from_table": "{example_table}",
+  "joins": [],
+  "where_conditions": [],
+  "group_by": [],
+  "having_conditions": [],
+    "order_by": [{{"column": "{example_metric_column}", "direction": "DESC"}}],
+  "limit": 1,
+  "offset": 0,
+  "clarification_needed": false,
+  "clarification_question": null,
+  "clarification_options": []
+}}
+⚠️ SUPERLATIVE RULE: Words like "highest", "maximum", "top", "greatest", "largest" → ORDER BY column DESC LIMIT 1
+⚠️ SUPERLATIVE RULE: Words like "lowest", "minimum", "bottom", "smallest", "least" → ORDER BY column ASC LIMIT 1
+⚠️ If user asks "which X has highest Y" → MUST use ORDER BY Y DESC LIMIT 1
+
+EXAMPLE 2 - Complex query with multiple features (ONLY if user requests all these):
+User: "show me records with status ACTIVE or INACTIVE, grouped by region, sorted by count desc, limit 100"
+Output:
+{{
+  "distinct": false,
+  "select_expressions": ["primary_table.id", "primary_table.region"],
+  "select_aggregates": [
+    {{"fn": "COUNT", "expr": "related_table.id", "alias": "item_count"}},
+    {{"fn": "SUM", "expr": "related_table.amount", "alias": "total_amount"}}
   ],
+  "from_table": "primary_table",
   "joins": [
     {{
-      "right_table": "cards",
+      "right_table": "related_table",
       "join_type": "INNER",
       "on_conditions": [
         {{
-          "left_column": "customers.customer_id",
-          "right_column": "cards.customer_id",
+          "left_column": "primary_table.id",
+          "right_column": "related_table.primary_id",
           "operator": "="
         }}
       ]
     }}
-  ]
+  ],
+  "where_conditions": [
+    {{"left": "related_table.status", "operator": "IN", "right": ["ACTIVE", "INACTIVE"], "right_kind": "list"}}
+  ],
+  "group_by": ["primary_table.region"],
+  "having_conditions": [],
+  "order_by": [
+    {{"column": "item_count", "direction": "DESC"}}
+  ],
+  "limit": 100,
+  "offset": 0,
+  "clarification_needed": false,
+  "clarification_question": null,
+  "clarification_options": []
 }}
+
+COMPOSABLE RULES:
+✅ Your query plan is a COMPOSITION of these OPTIONAL clauses:
+   - SELECT [DISTINCT] columns [+ aggregates]
+   - FROM table1
+   - [JOIN table2 ON conditions] (0 or more joins)
+   - [WHERE conditions] (0 or more conditions ANDed together)
+   - [GROUP BY columns] [HAVING conditions]
+   - [ORDER BY columns ASC|DESC]
+   - [LIMIT n] [OFFSET n]
+
+✅ OPERATORS & RIGHT_KIND MAPPING (How to structure conditions):
+    - Literal value: {{"operator": "=", "right": "VALUE", "right_kind": "literal"}}
+    - List of values: {{"operator": "IN", "right": ["VALUE1", "VALUE2"], "right_kind": "list"}}
+   - Range (BETWEEN): {{"operator": "BETWEEN", "right": ["2024-01-01", "2024-12-31"], "right_kind": "range"}}
+   - Column reference: {{"operator": "=", "right": "other_table.other_column", "right_kind": "column"}}
+   - Subquery: {{"operator": "IN", "right": "SELECT id FROM...", "right_kind": "subquery"}}
+   - Raw expression: {{"operator": "=", "right": "NOW()", "right_kind": "raw"}}
+
+✅ SUPPORTED OPERATORS (will be rendered dynamically regardless of dialect):
+   Comparison: =, <>, <, >, <=, >=, <>, !=
+   Pattern: LIKE, ILIKE, NOT LIKE
+   Null: IS NULL, IS NOT NULL
+   Range: BETWEEN
+   List: IN, NOT IN
+   Existence: EXISTS, NOT EXISTS
 
 ⚠️ WHERE CONDITIONS: Extract filter criteria DYNAMICALLY from user query
 - If user mentions "active", "inactive", "premium", "standard", etc. → ADD WHERE conditions
@@ -949,10 +1278,40 @@ EXAMPLE (using REAL table/column names from schema below):
 - DO NOT add filters the user didn't mention (zero hardcoding)
 - If user says "all records" or no filters mentioned → use empty array []
 
+⚠️ CLARIFICATION FIELDS (LLM-driven):
+If you need user input BEFORE generating a full query, set:
+  "clarification_needed": true,
+  "clarification_question": "Which metric would you like to see: record count or total amount?",
+  "clarification_options": ["Record Count", "Total Amount", "Both"]
+
+This immediately returns the question to the user (ChatGPT-style), and the query generation retries after user responds.
+
+⚠️ AGGREGATES STRUCTURE:
+Use "fn" (function name), "expr" (column to aggregate), "alias" (result name):
+  [
+    {{"fn": "COUNT", "expr": "table.id", "alias": "record_count"}},
+    {{"fn": "SUM", "expr": "table.amount", "alias": "total"}},
+    {{"fn": "AVG", "expr": "table.value", "alias": "avg_value"}}
+  ]
+
+Functions: COUNT, SUM, AVG, MIN, MAX, STDDEV
+
 ⚠️ NOTE: LIMIT is NOT required - use count-first approach!
 LIMIT enforcement is handled automatically by apply_smart_limit() after COUNT probe.
-Generate ONLY: select_expressions, from_table, where_conditions, joins
-DO NOT include: limit, suggested_limit, limit_reasoning
+
+⚠️ RESPONSE CONSTRUCTION RULES:
+1. Always include these base fields: distinct, select_expressions, from_table, limit, offset, clarification_needed
+2. Use empty arrays/null for optional features NOT requested:
+   - select_aggregates: [] (empty if no COUNT/SUM/AVG mentioned)
+   - joins: [] (empty if only single table query)
+   - where_conditions: [] (empty if no filters mentioned)
+   - group_by: [] (empty if no grouping mentioned)
+   - having_conditions: [] (empty if no group filtering mentioned)
+   - order_by: [] (empty if no sorting mentioned)
+3. DO NOT add fields or features beyond what the user requests
+4. If "get all X" or "list X" → select_expressions=["*"], no joins, no aggregates
+5. If user mentions "count" or "how many" → use select_aggregates with COUNT
+6. If user mentions specific columns → list them instead of ["*"]
 
 ⚠️ IMPORTANT FOR JOINS:
 - Use "right_table" field (NOT "table")
@@ -961,28 +1320,37 @@ DO NOT include: limit, suggested_limit, limit_reasoning
 - Join types: INNER, LEFT, RIGHT, FULL, CROSS
 
 CRITICAL RULES:
-1. ⚠️ USE REAL COLUMN NAMES ONLY - Column names are shown with SAMPLE values (in brackets)
-   - Example: "cards: [...card_id, customer_id, status...]" means these are ACTUAL columns
+1. ⚠️ PREVENT HALLUCINATION: Do NOT invent features
+    - If user says "get all {example_table}" → DO NOT add where conditions, joins, or aggregates
+   - Only include what user explicitly asks for
+   - Empty arrays [] for unused features (not null, not ignored)
+   
+2. ⚠️ USE REAL COLUMN NAMES ONLY - Column names are shown with SAMPLE values (in brackets)
+    - Example: "some_table: [...id, related_id, status...]" means these are ACTUAL columns
    - Example sample values shown like "status: [ACTIVE, INACTIVE]" are REAL data from database
-   - DO NOT invent column names like "card_status" if not listed with samples
-2. Match user query keywords to actual columns shown with samples
+    - DO NOT invent column names like "status_flag" if not listed with samples
+   
+3. Match user query keywords to actual columns shown with samples
    - If user says "active" and you see "status: [ACTIVE, INACTIVE]" → use status column
    - If a column isn't shown with sample values, it may not exist in your data sample
-3. Use ONLY tables and columns from the AVAILABLE TABLES below
-4. If user query mentions keywords that map to specific tables (e.g., "credit card" → include 'cards' table), MUST include those tables
-5. If query mentions multiple concepts (e.g., "credit card customers"), include joins to connect all relevant tables
-6. ANALYZE user query for implicit filters (status, type, category, grade, amount ranges, dates, etc.)
-7. DO NOT use placeholder names like "table1", "column1" etc.
-8. ALWAYS use the exact field names shown in the EXAMPLE above
-9. ZERO HARDCODING: Only include filters if user actually requested them
+   
+4. Use ONLY tables and columns from the AVAILABLE TABLES below
+5. If the user explicitly names an entity that matches a table in AVAILABLE TABLES, include that table
+6. If the query mentions multiple entities that correspond to different tables, include joins to connect them
+7. ANALYZE user query for explicit filters ONLY (status, type, category, grade, amount ranges, dates, etc.)
+8. DO NOT use placeholder names like "table1", "column1" etc.
+9. ALWAYS use the exact field names shown in the EXAMPLE above
 10. ✅ VALIDATION: Before using a column in WHERE/GROUP BY/ORDER BY, verify it's listed in schema section below
+11. ⚠️ SUPERLATIVES: If user asks for "highest/top/maximum/greatest" → ORDER BY column DESC LIMIT 1
+    If user asks for "lowest/bottom/minimum/smallest/least" → ORDER BY column ASC LIMIT 1
+    Match the superlative word to the relevant column (e.g., "highest amount" → ORDER BY amount DESC LIMIT 1)
 
 USER QUERY: {user_query}
 
 AVAILABLE TABLES AND COLUMNS:
 {schema_context}{regeneration_guidance}
 
-REQUIRED: Generate the QueryPlan JSON ONLY. Use REAL table/column names and field names exactly as shown in EXAMPLE. Extract filters DYNAMICALLY from user query - no hardcoding. No markdown, no explanations."""
+REQUIRED: Generate the complete QueryPlan JSON ONLY. Use REAL table/column names. Only include fields for features the user requests. Empty arrays [] for unused features. No markdown, no explanations."""
         
         from .. import llm
         
@@ -1076,10 +1444,10 @@ REQUIRED: Generate the QueryPlan JSON ONLY. Use REAL table/column names and fiel
         to actual columns in the database that contain those values.
         
         Example:
-        - User: "I want credit card customers"
+        - User: "Show records with category premium"
         - LLM generates: WHERE status = 'ACTIVE' (generic)
-        - Value grounding finds: 'credit' → card_type column has 'CREDIT' values
-        - Enhanced: Add WHERE card_type = 'CREDIT'
+        - Value grounding finds: 'premium' → category column has 'PREMIUM' values
+        - Enhanced: Add WHERE category = 'PREMIUM'
         
         Args:
             plan: QueryPlan from LLM
@@ -1099,8 +1467,8 @@ REQUIRED: Generate the QueryPlan JSON ONLY. Use REAL table/column names and fiel
             
             # ✅ FIX: Build ALL_COLUMNS mapping for value grounding
             # The retriever only returns top-3 columns, but value grounding needs
-            # to search ALL columns to find columns like 'card_type' that have sample values
-            # matching the user's query keywords (e.g., 'credit' -> finds 'CREDIT' in card_type)
+            # to search ALL columns to find attribute columns that have sample values
+            # matching the user's query keywords (e.g., 'premium' -> finds 'PREMIUM' in category)
             all_columns_per_table = {}
             for table_name in plan_tables:
                 if catalog and table_name in catalog.tables:
@@ -1202,7 +1570,11 @@ REQUIRED: Generate the QueryPlan JSON ONLY. Use REAL table/column names and fiel
         return schema_text
     
     def _dict_to_query_plan(self, plan_dict: Dict[str, Any]) -> QueryPlan:
-        """Convert LLM-generated dict to QueryPlan object."""
+        """
+        Convert LLM-generated dict to QueryPlan object.
+        Handles all fields including new ones: distinct, limit, offset, group_by, having,
+        order_by, and clarification fields.
+        """
         # Extract fields with defaults
         select_exprs = plan_dict.get("select_expressions", ["*"])
         from_table = plan_dict.get("from_table", "")
@@ -1226,21 +1598,55 @@ REQUIRED: Generate the QueryPlan JSON ONLY. Use REAL table/column names and fiel
         
         select_exprs = cleaned_exprs
         
-        # Convert where conditions - ROBUST: handle both dict and string formats
+        # ✅ NEW: Parse select_aggregates with dynamic "fn", "expr", "alias" fields
+        select_aggregates = []
+        for agg in plan_dict.get("select_aggregates", []):
+            if isinstance(agg, dict):
+                agg_fn = agg.get("fn", "COUNT").upper()
+                agg_expr = agg.get("expr")
+                agg_alias = agg.get("alias")
+                
+                try:
+                    agg_type = AggregationType[agg_fn]
+                    select_aggregates.append(
+                        AggregateField(
+                            function=agg_type,
+                            column=agg_expr,
+                            alias=agg_alias
+                        )
+                    )
+                except KeyError:
+                    logger.warning(f"[PLAN-FIRST] Unknown aggregation function: {agg_fn}")
+        
+        # Convert where conditions - ROBUST: handle dict format with new right_kind field
         where_conds = []
         for cond in plan_dict.get("where_conditions", []):
-            # Handle case where LLM returns a string instead of object (e.g., "card_type = 'CREDIT'")
+            # Handle case where LLM returns a string instead of object (e.g., "status = 'ACTIVE'")
             if isinstance(cond, str):
                 # Skip malformed string conditions
                 logger.debug(f"[PLAN-FIRST] Skipping string WHERE condition (not structured): {cond[:50]}")
                 continue
             elif isinstance(cond, dict):
+                # Support both old and new field names for backward compatibility
+                left = cond.get("left") or cond.get("column", "")
+                operator = cond.get("operator", "=")
+                right = cond.get("right") or cond.get("value")
+                
+                # NEW: Parse right_kind (defaults to LITERAL for backward compatibility)
+                right_kind_str = cond.get("right_kind", "literal").lower()
+                try:
+                    right_kind = RightKind(right_kind_str)
+                except (ValueError, KeyError):
+                    logger.debug(f"[PLAN-FIRST] Unknown right_kind'{right_kind_str}', defaulting to literal")
+                    right_kind = RightKind.LITERAL
+                
                 where_conds.append(
                     WhereCondition(
-                        left=cond.get("column", ""),
-                        operator=cond.get("operator", "="),
-                        right=cond.get("value", ""),
-                        is_literal=cond.get("is_literal", True),
+                        left=left,
+                        operator=operator,
+                        right=right,
+                        right_kind=right_kind,
+                        is_literal=(right_kind == RightKind.LITERAL)  # For backward compatibility
                     )
                 )
         
@@ -1252,11 +1658,11 @@ REQUIRED: Generate the QueryPlan JSON ONLY. Use REAL table/column names and fiel
                 continue
             
             # ✅ HANDLE BOTH FORMATS:
-            # Format 1 (structured): {"right_table": "cards", "on_conditions": [...]}
-            # Format 2 (LLM actual): {"table": "cards", "on_expression": "cards.customer_id = ..."}
+            # Format 1 (structured): {"right_table": "table_b", "on_conditions": [...]}
+            # Format 2 (LLM actual): {"table": "table_b", "on_expression": "table_b.fk_id = ..."}
             
             right_table = join.get("right_table") or join.get("table", "")
-            join_type = join.get("join_type", "INNER")
+            join_type = join.get("join_type", "INNER").upper()
             logger.debug(f"[PLAN-FIRST] Processing JOIN #{idx+1}: right_table='{right_table}', type='{join_type}', keys={list(join.keys())}")
             
             conditions = []
@@ -1279,7 +1685,7 @@ REQUIRED: Generate the QueryPlan JSON ONLY. Use REAL table/column names and fiel
                 # Try on_expression (Format 2 - LLM actual output)
                 on_expr = join.get("on_expression", "")
                 if on_expr:
-                    # Parse simple expression like "cards.customer_id = customers.customer_id"
+                    # Parse simple expression like "table_b.fk_id = table_a.id"
                     # This is a string, we'll store it as a raw condition for now
                     # The renderer handles ON clause generation differently
                     logger.debug(f"[PLAN-FIRST] JOIN #{idx+1} has on_expression (string): {on_expr}")
@@ -1288,21 +1694,106 @@ REQUIRED: Generate the QueryPlan JSON ONLY. Use REAL table/column names and fiel
             if not right_table:
                 logger.warning(f"[PLAN-FIRST] ⚠️ JOIN #{idx+1} has empty right_table! Full join object: {join}")
             
+            # Parse join_type enum
+            try:
+                join_type_enum = JoinType[join_type]
+            except KeyError:
+                logger.warning(f"[PLAN-FIRST] Unknown join type '{join_type}', defaulting to INNER")
+                join_type_enum = JoinType.INNER
+            
             join_clauses.append(
                 JoinClause(
-                    join_type=JoinType(join_type),
+                    join_type=join_type_enum,
                     right_table=right_table,
                     right_schema=None,
                     conditions=conditions,
                 )
             )
         
+        # ✅ NEW: Parse group_by (list of column names)
+        group_by = plan_dict.get("group_by", [])
+        if not isinstance(group_by, list):
+            group_by = []
+        
+        # ✅ NEW: Parse having_conditions (same structure as where_conditions)
+        having_conds = []
+        for cond in plan_dict.get("having_conditions", []):
+            if isinstance(cond, dict):
+                left = cond.get("left") or cond.get("column", "")
+                operator = cond.get("operator", "=")
+                right = cond.get("right") or cond.get("value")
+                
+                right_kind_str = cond.get("right_kind", "literal").lower()
+                try:
+                    right_kind = RightKind(right_kind_str)
+                except (ValueError, KeyError):
+                    right_kind = RightKind.LITERAL
+                
+                having_conds.append(
+                    WhereCondition(
+                        left=left,
+                        operator=operator,
+                        right=right,
+                        right_kind=right_kind,
+                        is_literal=(right_kind == RightKind.LITERAL)
+                    )
+                )
+        
+        # ✅ NEW: Parse order_by (list of {column, direction} objects)
+        order_by = []
+        for field in plan_dict.get("order_by", []):
+            if isinstance(field, dict):
+                col = field.get("column", "")
+                direction_str = field.get("direction", "ASC").upper()
+                try:
+                    direction = OrderDirection[direction_str]
+                except KeyError:
+                    direction = OrderDirection.ASC
+                
+                if col:
+                    order_by.append(OrderByField(column=col, direction=direction))
+        
+        # ✅ NEW: Parse limit and offset
+        limit = plan_dict.get("limit")
+        if limit is not None:
+            try:
+                limit = int(limit) if limit else None
+            except (ValueError, TypeError):
+                limit = None
+        
+        offset = plan_dict.get("offset")
+        if offset is not None:
+            try:
+                offset = int(offset) if offset else None
+            except (ValueError, TypeError):
+                offset = None
+        
+        # ✅ NEW: Parse distinct
+        distinct = plan_dict.get("distinct", False)
+        if not isinstance(distinct, bool):
+            distinct = False
+        
+        # ✅ NEW: Parse clarification fields
+        clarification_needed = plan_dict.get("clarification_needed", False)
+        clarification_question = plan_dict.get("clarification_question")
+        clarification_options = plan_dict.get("clarification_options", [])
+        
         plan = QueryPlan(
             select_expressions=select_exprs,
+            select_aggregates=select_aggregates,
             from_table=from_table,
             from_schema=plan_dict.get("from_schema"),
             where_conditions=where_conds,
             joins=join_clauses,
+            group_by=group_by,
+            having_conditions=having_conds,
+            order_by=order_by,
+            limit=limit,
+            offset=offset,
+            distinct=distinct,
+            clarification_needed=clarification_needed,
+            clarification_question=clarification_question,
+            clarification_options=clarification_options,
             intent="select",
             confidence=0.85,  # LLM-generated plans have good confidence
         )
@@ -1362,12 +1853,12 @@ REQUIRED: Generate the QueryPlan JSON ONLY. Use REAL table/column names and fiel
             
             # Try to create basic JOINs for remaining tables
             # This is a heuristic: assume tables can be joined via common patterns
-            # e.g., customers → cards (customer_id), transactions (customer_id), etc.
+            # e.g., table_a → table_b via shared foreign key patterns
             
             for i in range(1, min(len(tables), 4)):  # Max 3 tables (limit complexity)
                 right_table = tables[i]
                 # Heuristic join condition: look for foreign key pattern
-                # Most common: table_name_id (customer_id for customers table)
+                # Most common: table_name_id (e.g., entity_id for entity table)
                 join_condition_col = None
                 
                 # Try common patterns: {from_table_singular}_id

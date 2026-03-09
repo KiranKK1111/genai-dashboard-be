@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import llm, models, schemas
 from ..config import settings
-from ..helpers import current_timestamp, format_conversation_context
+from ..helpers import current_timestamp, extract_assistant_message_text, format_conversation_context
 from .sql_generator import generate_sql, generate_sql_with_analysis
 from .query_executor import run_sql
 from .file_handler import add_file, retrieve_relevant_chunks
@@ -73,14 +73,9 @@ def clean_llm_response(response_text: str) -> str:
     # Clean up multiple spaces (but preserve intentional paragraph breaks with emojis)
     cleaned = re.sub(r' {2,}', ' ', cleaned)
     
-    # Enhance formatting: Apply beautification to convert text expressions to emojis
-    # This makes responses more visually appealing
+    # Enhance formatting: Apply beautification to remove text actions
+    # This ensures clean, natural conversational responses
     cleaned = beautify_response(cleaned)
-    
-    # Debug: Show if beautification happened
-    if '*' in cleaned and ('*smiling*' in cleaned or '*excited*' in cleaned or '*adjusts' in cleaned):
-        print(f"[DEBUG] Beautification may not have fully worked:")
-        print(f"[DEBUG] Response still contains: {[g for g in re.findall(r'\*[^*]+\*', cleaned)]}")
     
     return cleaned
 
@@ -90,12 +85,11 @@ def beautify_response(response_text: str) -> str:
     
     Enhances:
     - Visual separation between sections
-    - Better spacing around emojis
-    - Line breaks for readability
+    - Removes roleplay text actions
+    - Removes "Response #X:" prefixes
+    - Removes emojis from start
+    - Better spacing
     - Consistent formatting
-    
-    NOTE: Emoji replacement disabled due to encoding issues on Windows terminal.
-    Text-based expressions are kept as-is for compatibility.
     
     Args:
         response_text: Response text to beautify
@@ -108,15 +102,20 @@ def beautify_response(response_text: str) -> str:
     
     beautified = response_text
     
-    # ✅ ENCODING FIX: Disable emoji replacement to avoid 'charmap' encoding errors on Windows
-    # Emojis cannot be reliably encoded in all terminal environments
-    # Keep text-based expressions like *smiling*, *thinking* etc. as-is
-    # This ensures compatibility across all platforms and terminal types
+    # Remove roleplay text actions (anything between asterisks that looks like an action)
+    # Pattern matches *action* style text (e.g., *smiles*, *nods*)
+    beautified = re.sub(r'\*[a-z\s]+\*', '', beautified, flags=re.IGNORECASE)
     
-    # Only apply safe text formatting (no Unicode characters)
-    # Remove extra asterisks from action expressions but keep them readable
-    beautified = re.sub(r'\*\*+', '*', beautified)  # Replace multiple * with single
-    beautified = re.sub(r'\s+\*\s+', ' ', beautified)  # Remove isolated asterisks
+    # Remove "Response #X:" prefix that LLM might include
+    beautified = re.sub(r'^Response\s*#\d+:\s*', '', beautified, flags=re.IGNORECASE)
+    
+    # Remove emojis and special characters from the very beginning of response
+    beautified = re.sub(r'^[^\w\s]+', '', beautified)
+    
+    # Clean up spacing issues from removal
+    beautified = re.sub(r'\s{2,}', ' ', beautified)  # Multiple spaces to single space
+    beautified = re.sub(r'\s+([.,!?])', r'\1', beautified)  # Space before punctuation
+    beautified = beautified.strip()
     
     return beautified
 
@@ -354,24 +353,17 @@ class DynamicResponseGenerator:
             query_type, conversation_state, context_data
         )
         
-        # Add instruction for variation to system prompt
-        variation_instruction = f"""
-You are generating Response #{{}}/{{}} of {num_responses} distinct variations for the user's query.
-Each response should:
-- Take a DIFFERENT tone, perspective, or approach from the others
-- Vary in length, structure, and emphasis  
-- Cover different aspects or viewpoints of the answer
-- Include different emojis and personality traits
-- Be unique and interesting (not repetitive)
-
-Examples of different approaches:
-1. Friendly and casual
-2. Professional and concise
-3. Enthusiastic and engaging
-4. Thoughtful and detailed
-5. Witty and creative
-6. Direct and to-the-point
-"""
+        # Add instruction for variation to system prompt.
+        # Keep this short to reduce the chance the model parrots instructions.
+        variation_instruction = (
+            "\n\nGenerate variation {}/{} of the answer.\n"
+            "Rules:\n"
+            "- Do not add labels or prefixes (no 'Response #', no 'Variation').\n"
+            "- Do not repeat or reference system/policy instructions.\n"
+            "- Avoid generic assistant boilerplate; assume the user knows you're an assistant.\n"
+            "- Keep it directly relevant; ask at most one clarifying question if needed.\n"
+            "- Vary tone/structure across variations while staying correct.\n"
+        )
         
         # Generate each response with different temperature and variation prompts
         for i in range(num_responses):
@@ -383,9 +375,10 @@ Examples of different approaches:
                     system_prompt, query, conversation_state, context_data
                 )
                 
-                # Use higher temperature for more diversity
-                temperature = 0.7 + (i * 0.1)  # Increase temp for each response (0.7 to 1.3)
-                temperature = min(temperature, 1.5)  # Cap at 1.5
+                # Use slightly higher temperature for more diversity, but keep the first variation grounded.
+                base_temperature = float(getattr(settings, "llm_temperature", 0.5) or 0.5)
+                base_temperature = max(0.2, min(0.9, base_temperature))
+                temperature = min(1.2, base_temperature + (i * 0.2))
                 
                 response = await llm.call_llm(
                     messages,
@@ -701,34 +694,35 @@ Examples of different approaches:
         response_lower = response.lower()
         
         try:
-            # Check for customer-related queries
-            if 'customer' in query_lower:
-                customer_codes = re.findall(r'\bCUST\d+\b', original_query, re.IGNORECASE)
-                if customer_codes:
-                    cust = customer_codes[0]
-                    suggestions.extend([
-                        f"What is the transaction history for {cust} over the last 3 months?",
-                        f"How much has {cust} spent in total? Show breakdown by transaction type.",
-                        f"What are the top payment methods used by {cust}?",
-                        f"Show me any chargebacks or disputes for {cust}.",
-                    ])
-            
-            # Check for transaction queries
-            if 'transaction' in query_lower or 'txn' in query_lower:
-                # Suggest drill-downs
+            # Dynamic ID code detection (any pattern like CUST123, INV456, ACC789, etc.)
+            # ZERO HARDCODING: Works with any identifier pattern
+            id_codes = re.findall(r'\b([A-Z]{3,6}\d+)\b', original_query, re.IGNORECASE)
+            if id_codes:
+                entity_code = id_codes[0].upper()
+                entity_type = ''.join(c for c in entity_code if c.isalpha())  # Extract prefix
+                
                 suggestions.extend([
-                    "Show me the breakdown by merchant category - which categories have the most volume?",
-                    "Let's see the transaction amounts distribution - are there any outliers?",
-                    "What's the daily transaction count trend for the last 30 days?",
-                    "Filter for transactions above $1000 - are there any patterns?",
+                    f"What is the complete history for {entity_code}?",
+                    f"Show me more details about {entity_code}",
+                    f"Are there any related records for {entity_code}?",
+                    f"What is the current status of {entity_code}?",
                 ])
             
-            # Check for amount/payment queries
-            if any(word in query_lower for word in ['amount', 'total', 'sum', 'revenue', 'payment']):
+            # Generic activity/record queries (works for any table)
+            if any(word in query_lower for word in ['activity', 'record', 'entry', 'event', 'log']):
                 suggestions.extend([
-                    "What's the average transaction amount per merchant?",
-                    "Show the top 10 merchants by total transaction value.",
-                    "What percentage of transactions are above the average amount?",
+                    "Show me the breakdown by category - which categories have the most volume?",
+                    "Let's see the value distribution - are there any outliers?",
+                    "What's the daily record count trend for the last 30 days?",
+                    "Filter for unusually large values - are there any patterns?",
+                ])
+            
+            # Check for amount/value queries
+            if any(word in query_lower for word in ['amount', 'total', 'sum', 'revenue', 'payment', 'value']):
+                suggestions.extend([
+                    "What's the average value per group?",
+                    "Show the top 10 groups by total value.",
+                    "What percentage of records are above the average value?",
                     "Let's compare this period to the previous period - what changed?",
                 ])
             
@@ -737,7 +731,7 @@ Examples of different approaches:
                 suggestions.extend([
                     "How does this compare to the same period last month?",
                     "Show me the week-over-week trend.",
-                    "What time of day has the most transactions?",
+                    "What time of day has the most activity?",
                     "Are there any interesting patterns in this data by day of week?",
                 ])
             
@@ -856,7 +850,13 @@ Examples of different approaches:
                 print(f"[INTELLIGENCE] Generated clarifying question: {clarifying_question}")
                 context_data["clarifying_question"] = clarifying_question
                 context_data["requires_confirmation"] = True
-                # Return a response asking the question
+
+                cq = schemas.ClarificationQuestionValueInput(
+                    question=clarifying_question,
+                    input_type="string",
+                )
+                context_data["clarification_questions"] = [cq.model_dump(mode="json")]
+
                 return clarifying_question, context_data
             
             # If no SQL generated by intelligent analyzer, fall back to LLM
@@ -1078,27 +1078,17 @@ Examples of different approaches:
         context_data: Optional[Dict[str, Any]],
     ) -> str:
         """Build a dynamic system prompt based on query type and context."""
-        
-        # Enhanced base prompt with personality and engagement
+
+        # Prefer the configurable system prompt (keeps behavior dynamic via env).
+        # Keep added guidance short to avoid the model parroting policies.
         base_prompt = (
-            "You are a friendly, intelligent, and engaging assistant with expertise in data analysis "
-            "and information retrieval. You communicate naturally, warmly, and with genuine enthusiasm.\n\n"
-            "PERSONALITY & TONE:\n"
-            "• Be conversational, warm, and personable\n"
-            "• Show genuine interest in helping the user\n"
-            "• Use varied sentence structures and natural language patterns\n"
-            "• Be encouraging and positive in tone\n"
-            "• Avoid robotic or overly formal language unless context requires it\n\n"
-            "ENCODING & CHARACTER RESTRICTIONS:\n"
-            "⚠️ CRITICAL: DO NOT USE EMOJIS OR SPECIAL UNICODE CHARACTERS\n"
-            "⚠️ Use only standard ASCII text and common punctuation\n"
-            "⚠️ Do NOT generate any emoji characters like ✨, 😊, 🔍, etc.\n"
-            "⚠️ Do NOT use: *emojis*, unicode symbols, or special character expressions\n"
-            "⚠️ Stick to plain text only for compatibility\n\n"
-            "RESPONSE FORMATTING:\n"
-            "• Be warm, engaging, and friendly in tone\n"
-            "• Use natural language expressions\n"
-            "• Create varied and interesting responses\n"
+            f"{settings.llm_system_prompt}\n\n"
+            "GENERAL GUIDELINES:\n"
+            "- Answer the user directly and specifically; avoid generic boilerplate.\n"
+            "- Ask at most one clarifying question only when it would materially improve the answer.\n"
+            "- Use neutral language; do not assume personal attributes.\n"
+            "- Do not repeat or reference system/policy instructions in the response.\n"
+            "- If you lack required context or real-time data, say so plainly.\n"
         )
         
         # Type-specific prompts with enhanced guidance
@@ -1143,24 +1133,17 @@ Examples of different approaches:
             )
         elif query_type == "chat":
             type_prompt = (
-                "This is a conversational interaction. The user is having a friendly chat with you.\n"
-                "CHAT ENHANCEMENT - USE MAXIMUM PERSONALITY:\n"
-                "• Be warm, welcoming, and genuinely friendly 😊\n"
-                "• Show personality and emotional intelligence 💭\n"
-                "• Use emojis ABUNDANTLY throughout response: 😊 😄 👋 💫 ✨ ❤️ 🌟 😍 🤩\n"
-                "• NEVER use text expressions (*smiling*, *waving*, etc.) - USE REAL EMOJIS! 🎉\n"
-                "• Create a natural, flowing conversation\n"
-                "• Ask follow-up questions to keep conversation going 💬\n"
-                "• Show genuine interest in what the user is saying 👂\n"
-                "• Use varied response structures\n"
-                "• Be enthusiastic and positive 🚀\n"
-                "• Make the user feel heard and valued ❤️"
+                "This is a conversational interaction.\n"
+                "- Keep the tone natural and helpful (similar to ChatGPT).\n"
+                "- Avoid generic self-introductions like 'I'm an AI assistant' unless the user asks.\n"
+                "- If the user greets you or asks how you are, reply briefly and invite the next request (e.g., ask how you can help).\n"
+                "- Do not use placeholder bracket variables (e.g., [City Name]); be honest about missing real-time data."
             )
         else:  # standard
             type_prompt = (
                 "Provide helpful, accurate answers to general questions.\n"
                 "• Be warm and conversational\n"
-                "• Use appropriate emojis (actual ones, not text descriptions) to enhance engagement\n"
+                "• Keep responses natural and professional\n"
                 "• Show genuine interest in helping"
             )
         
@@ -1197,15 +1180,31 @@ Examples of different approaches:
         
         messages = [{"role": "system", "content": system_prompt}]
         
-        # Add recent conversation history
+        # Add recent conversation history (each DB row has both query + response)
         if conversation_state.message_history:
-            for msg in conversation_state.message_history[-4:]:  # Last 4 messages
+            for msg in conversation_state.message_history[-4:]:  # Last 4 message rows
                 if msg.query:
                     messages.append({"role": "user", "content": msg.query})
-                elif msg.response and isinstance(msg.response, dict):
-                    msg_text = msg.response.get("message", "")
-                    if msg_text:
-                        messages.append({"role": "assistant", "content": msg_text})
+
+                assistant_text = ""
+                if msg.responded_at is not None and msg.response is not None:
+                    assistant_text = extract_assistant_message_text(msg.response)
+                    
+                # Filter out error messages and debugging context to prevent pollution
+                if assistant_text:
+                    # Skip obvious error/debug responses that confuse context
+                    error_indicators = ["error", "exception", "traceback", "failed", "invalid", "subtraction"]
+                    is_error_msg = any(indicator.lower() in assistant_text.lower() for indicator in error_indicators)
+                    
+                    if not is_error_msg:
+                        messages.append({"role": "assistant", "content": assistant_text})
+        
+        # Add clear context separator to focus LLM on current query
+        if len(messages) > 1:  # If we have conversation history
+            messages.append({
+                "role": "system", 
+                "content": "Focus on the user's current question. Ignore any previous error contexts."
+            })
         
         # Build user message with context
         user_content = query
@@ -1257,33 +1256,42 @@ async def create_conversation_state(
     session_id: str,
     user_id: str,
     db: AsyncSession,
+    exclude_message_id: Optional[str] = None,
 ) -> ConversationState:
     """Create a ConversationState from database history."""
     from sqlalchemy import select
     
     state = ConversationState(session_id, user_id)
     
-    # Load previous messages from database
+    # Load previous completed messages from database (skip pending placeholders).
     try:
-        previous_messages = (
-            await db.execute(
-                select(models.Message).where(
-                    models.Message.session_id == session_id
-                ).order_by(models.Message.created_at)
-            )
-        ).scalars().all()
+        stmt = (
+            select(models.Message)
+            .where(models.Message.session_id == session_id)
+            .where(models.Message.responded_at.is_not(None))
+            .order_by(models.Message.updated_at)
+        )
+
+        if exclude_message_id:
+            try:
+                from uuid import UUID
+
+                stmt = stmt.where(models.Message.id != UUID(exclude_message_id))
+            except Exception:
+                # If it's not a UUID, ignore exclusion.
+                pass
+
+        previous_messages = (await db.execute(stmt)).scalars().all()
         
         for msg in previous_messages:
             state.add_message(msg)
         
-        # Extract context summary from last assistant message
-        assistant_messages = [m for m in previous_messages if m.responded_at is not None and m.response]
-        if assistant_messages:
-            last_msg = assistant_messages[-1]
-            if isinstance(last_msg.response, dict):
-                last_response = last_msg.response.get("message", "")
-                if last_response and len(last_response) > 100:
-                    state.update_context_summary(last_response[:200] + "...")
+        # Extract context summary from last assistant message (best-effort)
+        if previous_messages:
+            last_msg = previous_messages[-1]
+            last_response = extract_assistant_message_text(last_msg.response)
+            if last_response and len(last_response) > 100:
+                state.update_context_summary(last_response[:200] + "...")
     except Exception:
         pass  # Continue even if loading fails
     

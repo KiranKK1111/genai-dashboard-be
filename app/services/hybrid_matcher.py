@@ -117,18 +117,18 @@ class HybridMatcher:
             reasons = []
             confidence = base_score
             
-            # Check for signature columns
+            # Note: No longer using hardcoded signature columns
+            # LLM scoring handles semantic understanding
             col_names = set(table_info.columns.keys())
-            mapping = self.normalizer.concepts.get(entity)
             
-            if mapping:
-                sig_matches = [
-                    col for col in mapping.signature_columns
-                    if any(col.lower() in cn.lower() for cn in col_names)
-                ]
-                if sig_matches:
-                    reasons.append(f"Contains signature columns: {', '.join(sig_matches[:3])}")
-                    confidence += 0.1
+            # Generic heuristic: entity name in column names indicates relevance
+            entity_col_matches = [
+                col for col in col_names
+                if entity.value.lower() in col.lower()
+            ]
+            if entity_col_matches:
+                reasons.append(f"Contains related columns: {', '.join(entity_col_matches[:3])}")
+                confidence = min(confidence + 0.1, 1.0)
             
             # Step 2: LLM semantic scoring (if scorer provided)
             if llm_scorer:

@@ -93,9 +93,15 @@ class SQLSafetyValidator:
     ]
     
     # SQL injection patterns
+    # NOTE: These patterns are intentionally conservative to avoid false positives
+    # the OR/AND injection pattern requires an actual comparison (like 'x'='x') not just any quoted string
     INJECTION_PATTERNS = {
         r"(?:or|and)\s+1\s*=\s*1": "Tautology pattern detected (or 1=1)",
-        r"(?:or|and)\s+['\"].+['\"]": "OR-based injection pattern",
+        # Match injection patterns like: OR 'x'='x', OR 'a'='a', OR ''=''
+        # Pattern: (OR|AND) followed by quoted_string = quoted_string
+        r"(?:or|and)\s+['\"][^'\"]*['\"]\s*=\s*['\"][^'\"]*['\"]": "OR/AND-based injection pattern",
+        # NULL comparisons: OR field IS NULL (injection technique)  
+        r"(?:or|and)\s+\w+\s+is\s+null": "SQL injection pattern detected",
         # NOTE: UNION pattern removed - AST validation handles this more reliably
         r"into\s+(outfile|infile|dumpfile)": "File I/O attempt detected",
         r";\s*\w+": "Multiple statements detected",
@@ -184,7 +190,8 @@ class SQLSafetyValidator:
             # Fallback to regex-based validation
             query_type = self._detect_query_type(sql)
             if query_type != QueryType.SELECT:
-                return False, f"Only SELECT queries are allowed. Detected: {query_type.value}", ""
+                query_type_val = query_type.value if hasattr(query_type, 'value') else str(query_type)
+                return False, f"Only SELECT queries are allowed. Detected: {query_type_val}", ""
         
         # Check 2: Injection pattern detection
         if self.enable_injection_detection:
@@ -341,7 +348,8 @@ class SQLSafetyValidator:
             
             # Skip validation for databases without schema support
             if not capabilities.supports_schemas:
-                logger.debug(f"[DB-AGNOSTIC] Database {capabilities.dialect.value} doesn't support schemas, skipping validation")
+                dialect_val = capabilities.dialect.value if hasattr(capabilities.dialect, 'value') else str(capabilities.dialect)
+                logger.debug(f"[DB-AGNOSTIC] Database {dialect_val} doesn't support schemas, skipping validation")
                 return None
         except Exception as e:
             logger.debug(f"Could not get adapter capabilities: {e}, proceeding with schema validation")

@@ -1,16 +1,16 @@
 """
 Value-Based Column Grounding Service.
 
-When a user mentions values in their query (e.g., "credit card customers"),
+When a user mentions values in their query (e.g., "premium users"),
 this service searches the actual column sample data to find which columns
 actually contain those values. This prevents the LLM from hallucinating
 column names that don't match any real data.
 
 Example:
-- Query: "I want credit card customers"
-- Extract value: "credit"
-- Search sample_data: card_type column has ["CREDIT", "DEBIT", "PREPAID"]
-- Result: Column 'card_type' should be filtered for 'CREDIT'
+- Query: "I want premium users"
+- Extract value: "premium"
+- Search sample_data: status column has ["PREMIUM", "STANDARD", "BASIC"]
+- Result: Column 'status' should be filtered for 'PREMIUM'
 
 ZERO HARDCODING PRINCIPLE:
 - All configuration is dynamic and externalized
@@ -34,16 +34,19 @@ class ValueGroundingConfig:
     
     All parameters are loaded dynamically from environment or defaults.
     NO HARDCODING - all values are configurable.
+    
+    IMPORTANT: Default values are now conservative (high min_keyword_length)
+    to prevent false positive value grounding on stopwords and short words.
     """
     
     # Keyword extraction parameters (dynamic from environment)
     stop_words: Set[str] = field(default_factory=lambda: _load_stop_words_dynamic())
-    min_keyword_length: int = field(default_factory=lambda: int(os.getenv('VALUE_GROUNDING_MIN_KEYWORD_LENGTH', '1')))
+    min_keyword_length: int = field(default_factory=lambda: int(os.getenv('VALUE_GROUNDING_MIN_KEYWORD_LENGTH', '3')))
     
     # Confidence scoring parameters
     exact_match_confidence: float = field(default_factory=lambda: float(os.getenv('VALUE_GROUNDING_EXACT_MATCH_CONFIDENCE', '1.0')))
     substring_match_confidence: float = field(default_factory=lambda: float(os.getenv('VALUE_GROUNDING_SUBSTRING_MATCH_CONFIDENCE', '0.8')))
-    min_confidence_threshold: float = field(default_factory=lambda: float(os.getenv('VALUE_GROUNDING_MIN_CONFIDENCE', '0.0')))
+    min_confidence_threshold: float = field(default_factory=lambda: float(os.getenv('VALUE_GROUNDING_MIN_CONFIDENCE', '0.7')))
     
     # Column filtering parameters (generic columns that might be replaced)
     generic_columns: Set[str] = field(default_factory=lambda: _load_generic_columns_dynamic())
@@ -54,6 +57,10 @@ class ValueGroundingConfig:
     
     # Top-k results
     top_k_matches: int = field(default_factory=lambda: int(os.getenv('VALUE_GROUNDING_TOP_K_MATCHES', '1')))
+    
+    # Gating: only run value grounding if query contains real value candidates
+    enable_gating: bool = field(default_factory=lambda: os.getenv('VALUE_GROUNDING_ENABLE_GATING', 'true').lower() == 'true')
+    require_numeric_or_quoted: bool = field(default_factory=lambda: os.getenv('VALUE_GROUNDING_REQUIRE_NUMERIC_OR_QUOTED', 'true').lower() == 'true')
 
 
 def _load_stop_words_dynamic() -> Set[str]:
@@ -63,13 +70,30 @@ def _load_stop_words_dynamic() -> Set[str]:
     Environment variable: VALUE_GROUNDING_STOP_WORDS
     Format: comma-separated list (case-insensitive)
     
-    Defaults to empty set if not specified - system is fully flexible.
+    DEFAULT: Common English stop words (conservative approach)
+    If not specified, uses predefined set to prevent false positives.
     """
     stop_words_env = os.getenv('VALUE_GROUNDING_STOP_WORDS', '')
     if stop_words_env:
         return set(w.strip().lower() for w in stop_words_env.split(','))
-    # No defaults - truly zero hardcoding
-    return set()
+    
+    # DEFAULT: Common stop words to prevent false matches like 'i', 'to', 'a', etc.
+    default_stop_words = {
+        # Single letters
+        'a', 'i',
+        # Common prepositions
+        'to', 'in', 'on', 'at', 'by', 'for', 'of', 'or', 'and', 'but', 'if', 'is', 'not',
+        # Common articles and pronouns
+        'the', 'an', 'as', 'be', 'me', 'my', 'we', 'he', 'she', 'it', 'they',
+        # Common verbs
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
+        # Common adjectives/adverbs
+        'more', 'less', 'very', 'no', 'yes', 'so', 'only', 'just',
+        # Common nouns/misc
+        'one', 'two', 'some', 'any', 'all', 'each', 'both', 'other', 'which', 'what', 'where', 'when', 'why', 'how',
+    }
+    
+    return default_stop_words
 
 
 def _load_generic_columns_dynamic() -> Set[str]:
@@ -93,8 +117,8 @@ class ValueMatch:
     """Result of searching for a value in column samples."""
     table_name: str
     column_name: str
-    value_found: str  # The actual value found (e.g., "CREDIT")
-    search_term: str  # The search term (e.g., "credit")
+    value_found: str  # The actual value found (e.g., "PREMIUM")
+    search_term: str  # The search term (e.g., "premium")
     confidence: float  # 0.0-1.0
     sample_values: List[Any]  # All sample values for this column
 
@@ -136,9 +160,9 @@ class ValueBasedColumnGrounder:
         - No hardcoded logic, all configurable
         
         Examples:
-        - "credit card customers" → ["credit", "card"] (or based on config)
+        - "premium users" → ["premium", "users"] (or based on config)
         - "active accounts" → ["active"] (or based on config)
-        - "high value customers" → ["high", "value"] (or based on config)
+        - "high value accounts" → ["high", "value"] (or based on config)
         
         Args:
             query: User's natural language query
@@ -173,7 +197,7 @@ class ValueBasedColumnGrounder:
         - No hardcoded thresholds, all configurable
         
         Args:
-            value_term: The value to search for (e.g., "credit")
+            value_term: The value to search for (e.g., "premium")
             available_tables: Optional list of table names to restrict search to
             available_columns: Optional dict mapping table names to column names to restrict search to
             
@@ -281,6 +305,10 @@ class ValueBasedColumnGrounder:
         
         Returns a mapping of suggested filter conditions.
         
+        ✅ NEW: Semantic gating to prevent false positives on stopwords
+        - Only runs if query contains real candidate values
+        - Checks for numeric values, dates, quoted strings, known enums
+        
         Args:
             query: User's natural language query
             available_tables: Optional list of tables to restrict to
@@ -291,18 +319,40 @@ class ValueBasedColumnGrounder:
             {
                 "suggested_filters": [
                     {
-                        "table": "cards",
-                        "column": "card_type",
-                        "value": "CREDIT",
-                        "search_term": "credit",
+                        "table": "users",
+                        "column": "status",
+                        "value": "PREMIUM",
+                        "search_term": "premium",
                         "confidence": 0.95
                     }
                 ],
-                "search_terms": ["credit", "card"],
+                "search_terms": ["premium", "users"],
                 "total_matches": 2
             }
         """
+        
+        # ✅ GATE 1: Check if query contains real value candidates
+        if self.config.enable_gating:
+            if not self._has_value_candidates(query):
+                logger.info("[VALUE GROUNDING] Query has no meaningful value candidates, skipping value grounding (gating enabled)")
+                return {
+                    "suggested_filters": [],
+                    "search_terms": [],
+                    "total_matches": 0,
+                    "gating_reason": "no_value_candidates"
+                }
+        
         keywords = self.extract_keywords_from_query(query)
+        
+        # ✅ GATE 2: Verify we have non-trivial keywords after extraction
+        if not keywords:
+            logger.debug("[VALUE GROUNDING] No keywords extracted after filtering")
+            return {
+                "suggested_filters": [],
+                "search_terms": [],
+                "total_matches": 0,
+                "gating_reason": "no_keywords"
+            }
         
         all_filters = []
         
@@ -336,6 +386,56 @@ class ValueBasedColumnGrounder:
                 logger.info(f"  → {filt['table']}.{filt['column']} = '{filt['value']}' (search: '{filt['search_term']}')")
         
         return result
+    
+    def _has_value_candidates(self, query: str) -> bool:
+        """
+        Check if query likely contains valuable filter values.
+        
+        Looks for:
+        - Numeric values (123, 2024)
+        - Dates (2024-01-01, january, 2023)
+        - Quoted strings ("value")
+        - Emails (user@example.com)
+        - UUIDs
+        - Known enum patterns (ACTIVE, PENDING, etc.)
+        
+        Returns:
+            True if query appears to have value candidates, False if just generic words
+        """
+        query_lower = query.lower()
+        
+        # Pattern 1: Numbers (amounts, years, IDs)
+        if re.search(r'\b\d+\b', query):
+            logger.debug("[VALUE GROUNDING] Query contains numeric values")
+            return True
+        
+        # Pattern 2: Quoted strings
+        if re.search(r'["\']([^"\']+)["\']', query):
+            logger.debug("[VALUE GROUNDING] Query contains quoted values")
+            return True
+        
+        # Pattern 3: Known date patterns
+        if re.search(
+            r'(january|february|march|april|may|june|july|august|september|october|november|december|'
+            r'\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|2\d{3})',
+            query_lower
+        ):
+            logger.debug("[VALUE GROUNDING] Query contains date values")
+            return True
+        
+        # Pattern 4: Known enum patterns (all caps like ACTIVE, PENDING)
+        if re.search(r'\b([A-Z][A-Z_]+)\b', query):
+            logger.debug("[VALUE GROUNDING] Query contains enum-like values (ALL_CAPS)")
+            return True
+        
+        # Pattern 5: Email-like or UUID-like values
+        if re.search(r'[\w\.-]+@[\w\.-]+|[\da-f\-]{36}', query_lower):
+            logger.debug("[VALUE GROUNDING] Query contains email or UUID-like values")
+            return True
+        
+        # If no candidate patterns found
+        logger.debug("[VALUE GROUNDING] Query has no obvious value candidates")
+        return False
     
     def should_replace_where_condition(self, llm_condition: Dict[str, Any],
                                       grounded_filters: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

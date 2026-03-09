@@ -2,11 +2,12 @@
 Entity Parser - Extracts entities and filter values from user queries.
 
 Analyzes user queries to identify:
-- The entity type they're asking about (transaction, customer, etc.)
+- The entity/table type they're asking about
 - Filter values (ID, date range, amount thresholds, etc.)
 - Query intent (GET_BY_ID, LIST, AGGREGATE, FILTER, etc.)
 
 Works with Schema Discovery & Schema Normalizer to map to DB columns.
+Optional semantic intent classification (replaces hardcoded keywords if enabled).
 """
 
 from __future__ import annotations
@@ -18,6 +19,9 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .. import llm
+# NEW PHASE 2: Optional semantic intent classification
+from .intent_classifier import IntentClassifier, IntentClassification
+from ..config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,7 @@ class EntityParser:
     Parses natural language queries to extract entities and intents.
     
     Uses LLM for semantic understanding + simple regex for structured extraction.
+    Optionally uses semantic intent classifier (if enabled in config) instead of hardcoded keywords.
     """
     
     def __init__(self):
@@ -74,6 +79,15 @@ class EntityParser:
             r'(?:amount|total|value|above|below|greater|less|more|less)\s+(?:of|than)?\s*([₹$€£])?(\d+(?:[.,]\d+)*)',
             re.IGNORECASE
         )
+        
+        # NEW PHASE 2: Optional semantic intent classifier
+        self.intent_classifier: Optional[IntentClassifier] = None
+        if settings.enable_semantic_intent_classifier:
+            try:
+                self.intent_classifier = IntentClassifier()
+                logger.debug("[ENTITY PARSER] Semantic intent classifier enabled")
+            except Exception as e:
+                logger.warning(f"[ENTITY PARSER] Could not initialize semantic intent classifier: {e}")
     
     async def parse_query(self, user_query: str) -> ParsedQuery:
         """
@@ -98,9 +112,9 @@ Extract structured information and respond with ONLY valid JSON.
 Respond with this structure:
 {
   "intent": "get_by_id|list|count|aggregate|filter|group_by|join",
-  "primary_entity": "transaction|customer|order|merchant|account|...",
+  "primary_entity": "<the main entity/table user is asking about>",
   "filters": {
-    "field_name": "extracted_value" (e.g., {"transaction_id": "1353185"})
+    "field_name": "extracted_value" (e.g., {"id": "12345"})
   },
   "aggregation": "COUNT|SUM|AVG|MIN|MAX|null",
   "group_by": null or "column_name",
@@ -110,9 +124,9 @@ Respond with this structure:
 }
 
 Examples:
-{"intent":"get_by_id","primary_entity":"transaction","filters":{"transaction_id":"1353185"},"reasoning":"User asking for specific transaction"}
-{"intent":"list","primary_entity":"customer","filters":{},"reasoning":"User wants list of customers"}
-{"intent":"aggregate","primary_entity":"transaction","aggregation":"SUM","filters":{"merchant_id":"5001"},"reasoning":"User wants total amount for merchant"}
+{"intent":"get_by_id","primary_entity":"record","filters":{"id":"12345"},"reasoning":"User asking for specific record"}
+{"intent":"list","primary_entity":"entity","filters":{},"reasoning":"User wants a list"}
+{"intent":"aggregate","primary_entity":"data","aggregation":"SUM","filters":{},"reasoning":"User wants total"}
 """
         
         user_prompt = f"Parse this query: {user_query}"
@@ -159,9 +173,9 @@ Examples:
             
         except Exception as e:
             logger.warning(f"LLM parsing failed: {e}, falling back to regex")
-            return self._parse_with_regex(user_query)
+            return await self._parse_with_regex(user_query)
     
-    def _parse_with_regex(self, user_query: str) -> ParsedQuery:
+    async def _parse_with_regex(self, user_query: str) -> ParsedQuery:
         """Fallback: use regex patterns for simple extraction."""
         
         filters: Dict[str, Tuple[str, Any]] = {}
@@ -185,18 +199,39 @@ Examples:
         # Determine intent
         query_lower = user_query.lower()
         
-        if any(kw in query_lower for kw in ["count", "how many"]):
-            intent = QueryIntent.COUNT
-        elif any(kw in query_lower for kw in ["sum", "total", "average", "avg", "min", "max"]):
-            intent = QueryIntent.AGGREGATE
-        elif any(kw in query_lower for kw in ["group", "by", "grouped"]):
-            intent = QueryIntent.GROUP_BY
-        elif filters and len(filters) == 1 and any(kw in str(list(filters.keys())[0]).lower() for kw in ["id", "code", "ref"]):
-            intent = QueryIntent.GET_BY_ID
-        elif filters:
-            intent = QueryIntent.FILTER
-        else:
-            intent = QueryIntent.LIST
+        # NEW PHASE 2: Try semantic intent classifier first (if enabled)
+        intent = None
+        classification: Optional[IntentClassification] = None
+        
+        if self.intent_classifier:
+            try:
+                classification = await self.intent_classifier.classify_intent(user_query, None)
+                if classification and classification.confidence >= settings.intent_classification_confidence_threshold:
+                    intent = classification.intent
+                    intent_val = intent.value if hasattr(intent, 'value') else str(intent)
+                    logger.debug(
+                        f"[ENTITY PARSER] Semantic classification: {intent_val} "
+                        f"(confidence: {classification.confidence})"
+                    )
+            except Exception as e:
+                logger.debug(f"[ENTITY PARSER] Semantic classification failed: {e}")
+        
+        # Fallback to hardcoded keywords if classification didn't work or disabled
+        if intent is None:
+            if any(kw in query_lower for kw in ["count", "how many"]):
+                intent = QueryIntent.COUNT
+            elif any(kw in query_lower for kw in ["sum", "total", "average", "avg", "min", "max"]):
+                intent = QueryIntent.AGGREGATE
+            elif any(kw in query_lower for kw in ["group", "by", "grouped"]):
+                intent = QueryIntent.GROUP_BY
+            elif filters and len(filters) == 1 and any(kw in str(list(filters.keys())[0]).lower() for kw in ["id", "code", "ref"]):
+                intent = QueryIntent.GET_BY_ID
+            elif filters:
+                intent = QueryIntent.FILTER
+            else:
+                intent = QueryIntent.LIST
+        
+        reasoning = f"Semantic classification (confidence: {classification.confidence} )" if classification else "Extracted using hardcoded patterns"
         
         return ParsedQuery(
             intent=intent,
@@ -205,7 +240,7 @@ Examples:
                 filters={k: v[1] for k, v in filters.items()}
             )],
             filter_conditions=filters,
-            reasoning="Extracted using regex patterns",
+            reasoning=reasoning,
         )
     
     def extract_filter_value(self, query: str, field_name: str) -> Optional[Any]:

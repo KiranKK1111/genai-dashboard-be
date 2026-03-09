@@ -28,6 +28,13 @@ from .query_plan_generator import QueryPlanGenerator, QueryPlan, QueryPlanRender
 from .confidence_gate import ConfidenceGate
 from .dialect_adapter import get_adapter
 
+# NEW PHASE 1-5: Universal schema agnostic services
+from .schema_discovery_engine import SchemaDiscoveryEngine
+from .intent_classifier import IntentClassifier
+from .universal_value_grounder import UniversalValueGrounder
+from .semantic_concept_mapper import SemanticConceptMapper
+from ..config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -95,6 +102,23 @@ class SemanticQueryOrchestrator:
         self._plan_generator = QueryPlanGenerator()
         self._confidence_gate = ConfidenceGate()
         self._catalog_loaded_at: Optional[datetime] = None
+        
+        # NEW PHASE 1-5: Universal schema agnostic services (feature-flagged)
+        self.schema_discovery_engine: Optional[SchemaDiscoveryEngine] = None
+        self.intent_classifier: Optional[IntentClassifier] = None
+        self.value_grounder: Optional[UniversalValueGrounder] = None
+        self.concept_mapper: Optional[SemanticConceptMapper] = None
+        
+        # Initialize universal services if enabled and db_session available
+        if db_session:
+            if settings.enable_schema_discovery_engine:
+                self.schema_discovery_engine = SchemaDiscoveryEngine(db_session)
+            if settings.enable_semantic_intent_classifier:
+                self.intent_classifier = IntentClassifier()
+            if settings.enable_universal_value_grounder:
+                self.value_grounder = UniversalValueGrounder(db_session)
+            if settings.enable_semantic_concept_mapper:
+                self.concept_mapper = SemanticConceptMapper()
         
         logger.info(
             f"[SEMANTIC ORCHESTRATOR] Initialized "
@@ -210,7 +234,7 @@ CLASSIFY the user's intent into ONE category:
 
 1. ALL_COLUMNS - User wants to see all available columns
    Indicators: "all", "everything", "complete", "full", show/get/retrieve", "details"
-   KEY: "get all customers" = wants ALL customer columns, not just a few!
+    KEY: "get all <table>" = wants ALL columns for that entity, not just a few
 
 2. SPECIFIC_COLUMNS - User explicitly names specific columns they want
    Indicators: Exact column names mentioned like "name and email", "ID and status"
@@ -297,12 +321,13 @@ Always return valid JSON with your best semantic judgment."""
         self,
         user_query: str,
         clarification_response: Optional[str] = None,
+        followup_anchor: Optional[Dict[str, Any]] = None,
     ) -> SemanticQueryResult:
         """Execute full semantic query pipeline.
         
         Pipeline:
         1. Load/refresh catalog
-        2. Retrieve schema context
+        2. Retrieve schema context (optionally biased by followup_anchor)
         3. Generate query plan (LLM)
         4. Check confidence (gate)
         5. Render to SQL
@@ -311,6 +336,8 @@ Always return valid JSON with your best semantic judgment."""
         Args:
             user_query: Natural language query from user
             clarification_response: User's response to clarification question (if any)
+            followup_anchor: Optional follow-up context {previous_table, previous_filters, previous_sql}
+                            Used to bias plan generation toward previous query context
             
         Returns:
             SemanticQueryResult with SQL, plan, confidence, and trace
@@ -318,6 +345,14 @@ Always return valid JSON with your best semantic judgment."""
         trace: Dict[str, Any] = {}
         
         try:
+            # Determine if this is a follow-up with context
+            # Used throughout pipeline to adjust behavior (skip clarifications, force execution)
+            is_followup_with_context = followup_anchor and (
+                followup_anchor.get("previous_table") or 
+                followup_anchor.get("inferred_previous_table") or
+                followup_anchor.get("previous_sql")
+            )
+            
             # Stage 1: Load catalog
             trace[PipelineStage.CATALOG_LOAD] = "starting"
             await self.initialize_catalog()
@@ -325,7 +360,35 @@ Always return valid JSON with your best semantic judgment."""
             
             # Stage 2: Retrieve schema context
             trace[PipelineStage.RETRIEVAL] = "starting"
-            retrieval_context = await self.retrieve_schema_context(user_query)
+            
+            # NEW: If this is a follow-up query, bias retrieval toward previous table
+            if followup_anchor:
+                logger.info(f"[SEMANTIC RETRIEVAL] Using follow-up anchor context")
+                prev_table = followup_anchor.get("previous_table") or followup_anchor.get("inferred_previous_table")
+                # Include previous table in retrieval to anchor follow-up focus
+                retrieval_context = await self.retrieve_schema_context(user_query)
+                # Boost previous table to top if it exists in catalog
+                if prev_table and prev_table in retrieval_context.top_tables:
+                    retrieval_context.top_tables.remove(prev_table)
+                    retrieval_context.top_tables.insert(0, prev_table)
+                    logger.info(f"[SEMANTIC RETRIEVAL] Boosted previous table '{prev_table}' to top")
+                
+                # NEW: Fallback for follow-ups with 0 retrieval results
+                # If retrieval got nothing, bias toward previous table as last resort
+                if not retrieval_context.top_tables and prev_table:
+                    logger.info(f"[SEMANTIC RETRIEVAL] FALLBACK: Using previous table '{prev_table}' (retrieval got 0 results)")
+                    retrieval_context.top_tables = [prev_table]
+                    if prev_table in self._catalog.tables:
+                        table_meta = self._catalog.tables[prev_table]
+                        # table_meta.columns is a dict, so get values and slice
+                        all_columns = list(table_meta.columns.values()) if hasattr(table_meta.columns, 'values') else []
+                        retrieval_context.top_columns_per_table[prev_table] = [
+                            col.name for col in all_columns[:10]
+                        ]
+                    retrieval_context.confidence_score = 0.5  # Medium confidence (assisted by anchor)
+            else:
+                retrieval_context = await self.retrieve_schema_context(user_query)
+            
             trace[PipelineStage.RETRIEVAL] = {
                 "tables": retrieval_context.top_tables,
                 "confidence": retrieval_context.confidence_score
@@ -354,6 +417,34 @@ Always return valid JSON with your best semantic judgment."""
             )
             trace[PipelineStage.PLAN_GENERATION] = {"plan_type": "query_plan", "table": plan.from_table}
             
+            # ✅ NEW: Check if LLM indicates clarification is needed (ChatGPT-style)
+            # BUT: For follow-ups with context, SKIP this and force execution with previous table
+            # This allows refinements like "what about those in delhi" to work immediately
+            skip_clarification_for_followup = is_followup_with_context
+            
+            if plan.clarification_needed and not skip_clarification_for_followup:
+                logger.info(
+                    f"[SEMANTIC PIPELINE] LLM requested clarification: {plan.clarification_question}"
+                )
+                trace[PipelineStage.PLAN_GENERATION] = {
+                    "plan_type": "clarification_request",
+                    "question": plan.clarification_question,
+                    "options": plan.clarification_options
+                }
+                
+                # Return immediately with clarification question
+                return SemanticQueryResult(
+                    success=True,  # Not a failure - just asking for clarification
+                    sql="",
+                    plan=plan,  # Include the plan so UI can use options if provided
+                    retrieval_context=retrieval_context,
+                    confidence_score=0.0,  # Low confidence until clarified
+                    clarification_needed=True,
+                    clarification_question=plan.clarification_question,
+                    error=None,
+                    pipeline_trace=trace,
+                )
+            
             # NEW: Analyze column selection intent semantically using LLM
             logger.info("[SEMANTIC] Analyzing column selection intent...")
             column_analysis = await self.analyze_column_selection_intent(
@@ -362,15 +453,21 @@ Always return valid JSON with your best semantic judgment."""
                 retrieval_context.top_columns_per_table,
             )
             plan.column_selection = column_analysis
+            intent_val = column_analysis.intent.value if hasattr(column_analysis.intent, 'value') else str(column_analysis.intent)
             logger.info(
                 f"[SEMANTIC] Column selection recorded in plan: "
-                f"intent={column_analysis.intent.value}, confidence={column_analysis.confidence:.2f}"
+                f"intent={intent_val}, confidence={column_analysis.confidence:.2f}"
             )
             
             # Stage 4: Confidence gate
             trace[PipelineStage.CONFIDENCE_CHECK] = "starting"
             plan_confidence = retrieval_context.confidence_score  # Could be plan-specific
-            needs_clarification = self.enable_confidence_gate and plan_confidence < self.confidence_threshold
+            
+            needs_clarification = (
+                self.enable_confidence_gate and 
+                plan_confidence < self.confidence_threshold and
+                not is_followup_with_context  # SKIP gate for follow-ups with context
+            )
             
             if needs_clarification:
                 clarification_q = f"Did you mean to query {', '.join(retrieval_context.top_tables[:2])}?"
@@ -404,7 +501,8 @@ Always return valid JSON with your best semantic judgment."""
                 except Exception:
                     pass  # fallback to postgresql default
             adapter = get_adapter(dialect_name)
-            dialect = adapter.dialect.value
+            dialect_val = adapter.dialect.value if hasattr(adapter.dialect, 'value') else str(adapter.dialect)
+            dialect = dialect_val
             renderer = QueryPlanRenderer(dialect=dialect)
             sql = renderer.render(plan)
             trace[PipelineStage.RENDERING] = {"dialect": dialect, "sql_length": len(sql)}
@@ -447,6 +545,17 @@ Always return valid JSON with your best semantic judgment."""
             
         except Exception as e:
             logger.error(f"[SEMANTIC PIPELINE] Error: {str(e)}", exc_info=True)
+            
+            # CRITICAL: Rollback failed transaction to prevent InFailedSQLTransactionError
+            # If any DB operation failed (like MissingGreenlet), the transaction is marked as failed
+            # until we explicitly rollback. This prevents subsequent queries from failing.
+            if self.db_session:
+                try:
+                    await self.db_session.rollback()
+                    logger.debug("[SEMANTIC PIPELINE] Rolled back failed transaction")
+                except Exception as rollback_err:
+                    logger.warning(f"[SEMANTIC PIPELINE] Failed to rollback: {rollback_err}")
+            
             return SemanticQueryResult(
                 success=False,
                 sql="",
@@ -458,6 +567,228 @@ Always return valid JSON with your best semantic judgment."""
                 error=str(e),
                 pipeline_trace=trace,
             )
+    
+    # ===== NEW: Follow-up Anchor Selection (Plan-Diff System) =====
+    
+    async def select_followup_anchor(
+        self,
+        followup_query: str,
+        memory_store,  # QueryMemoryStore from SessionStateManager
+        top_k: int = 3,
+    ) -> Optional[Tuple[Any, float, List]]:
+        """
+        Select which past SQL query a follow-up should anchor to.
+        
+        Uses semantic similarity + recency + entity overlap.
+        If ambiguous (top candidates close), returns list for clarification.
+        
+        Args:
+            followup_query: The follow-up user query
+            memory_store: QueryMemoryStore with past executions
+            top_k: How many candidates to retrieve
+            
+        Returns:
+            Tuple of (anchor_execution, confidence, alternatives) or None if no history
+        """
+        if not memory_store or not memory_store.queries:
+            logger.debug("[FOLLOW-UP] No past queries in memory, treating as new request")
+            return None
+        
+        # Get top-K similar queries
+        candidates = memory_store.get_top_k_similar(followup_query, k=top_k)
+        
+        if not candidates:
+            logger.info("[FOLLOW-UP] No similar past queries found")
+            return None
+        
+        anchor, top_score = candidates[0]
+        
+        # Check if ambiguous (top-1 and top-2 are close)
+        if len(candidates) > 1:
+            second_score = candidates[1][1]
+            if abs(top_score - second_score) < 0.08:
+                logger.info(
+                    f"[FOLLOW-UP] Ambiguous anchor selection (diff={abs(top_score - second_score):.3f}), "
+                    f"returning top candidates for clarification"
+                )
+                alternatives = [(c[0].query_id, c[0].user_query, c[1]) for c in candidates[:3]]
+                return (anchor, top_score, alternatives)
+        
+        logger.info(f"[FOLLOW-UP] Selected anchor query (confidence={top_score:.2f})")
+        return (anchor, top_score, None)
+    
+    async def generate_plan_edits(
+        self,
+        anchor_plan: QueryPlan,
+        followup_query: str,
+        retrieval_context: RetrievalContext,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Generate plan edits for a follow-up instead of full regeneration.
+        
+        Calls LLM to output structured edits:
+        - add_filter, remove_filter
+        - set_limit, set_offset
+        - add_order_by, change_order_by
+        - add_group_by, modify_aggregates
+        
+        This is more stable than full SQL regeneration.
+        
+        Args:
+            anchor_plan: The plan from previous query
+            followup_query: The follow-up user request
+            retrieval_context: Retrieved schema context
+            
+        Returns:
+            Dict with "apply_to", "edits", "needs_clarification" fields, or None if can't edit
+        """
+        from .. import llm
+        
+        # Build anchor plan description for LLM
+        anchor_desc = f"""
+ANCHOR QUERY: {anchor_plan.user_query if hasattr(anchor_plan, 'user_query') else 'Previous query'}
+ANCHOR PLAN:
+- Tables: {', '.join([anchor_plan.from_table] + [j.right_table for j in anchor_plan.joins])}
+- Filters: {len(anchor_plan.where_conditions)} conditions
+- Group By: {anchor_plan.group_by if anchor_plan.group_by else 'none'}
+- Aggregates: {len(anchor_plan.select_aggregates)} aggregates
+- Order By: {len(anchor_plan.order_by)} fields
+- Limit/Offset: {anchor_plan.limit}/{anchor_plan.offset}
+"""
+        
+        llm_prompt = f"""You are helping a user modify a previous database query.
+
+{anchor_desc}
+
+FOLLOW-UP REQUEST: "{followup_query}"
+
+Your job: Generate structured EDITS to the anchor plan, not a new query.
+
+COMMON EDITS:
+- Add filter: {{"op":"add_filter","left":"column","operator":"=","right":"value","right_kind":"literal"}}
+- Remove filter: {{"op":"remove_filter","filter_index":0}}
+- Set limit: {{"op":"set_limit","value":100}}
+- Add order by: {{"op":"add_order_by","column":"name","direction":"DESC"}}
+- Set group by: {{"op":"set_group_by","columns":["status","type"]}}
+
+RESPOND WITH ONLY THIS JSON (no markdown):
+{{
+  "apply_to": "anchor_query_id",
+  "edits": [
+    {{"op":"..."," ...}}
+  ],
+  "needs_clarification": false,
+  "clarification_question": null
+}}"""
+        
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a plan editor. Output ONLY valid JSON, no other text."
+            },
+            {
+                "role": "user",
+                "content": llm_prompt
+            }
+        ]
+        
+        try:
+            response = await llm.call_llm(messages, stream=False, max_tokens=500)
+            
+            # Parse JSON
+            import json
+            if response.startswith("```"):
+                response = response.split("```")[1]
+                if response.startswith("json"):
+                    response = response[4:]
+                response = response.strip()
+            if response.endswith("```"):
+                response = response[:-3].strip()
+            
+            result = json.loads(response)
+            logger.info(f"[PLAN EDITS] Generated {len(result.get('edits', []))} edits")
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"[PLAN EDITS] Generation failed: {e}")
+            return None
+    
+    def apply_plan_edits(self, anchor_plan: QueryPlan, edits: List[Dict]) -> QueryPlan:
+        """
+        Deterministically apply edits to a plan.
+        
+        Supports: add_filter, remove_filter, set_limit, add_order_by, etc.
+        
+        Args:
+            anchor_plan: Original plan
+            edits: List of edit operations
+            
+        Returns:
+            Updated plan (new instance)
+        """
+        import copy
+        from .query_plan_generator import WhereCondition, RightKind, OrderByField, OrderDirection
+        
+        # Clone the plan
+        updated_plan = copy.deepcopy(anchor_plan)
+        
+        for edit in edits:
+            op = edit.get("op")
+            
+            if op == "add_filter":
+                # Add a WHERE condition
+                cond = WhereCondition(
+                    left=edit.get("left"),
+                    operator=edit.get("operator", "="),
+                    right=edit.get("right"),
+                    right_kind=RightKind(edit.get("right_kind", "literal"))
+                )
+                updated_plan.where_conditions.append(cond)
+                logger.debug(f"[PLAN EDIT] Added filter: {cond.left} {cond.operator} {cond.right}")
+            
+            elif op == "remove_filter":
+                # Remove a WHERE condition by index
+                idx = edit.get("filter_index", 0)
+                if 0 <= idx < len(updated_plan.where_conditions):
+                    removed = updated_plan.where_conditions.pop(idx)
+                    logger.debug(f"[PLAN EDIT] Removed filter at index {idx}")
+            
+            elif op == "set_limit":
+                # Set LIMIT
+                updated_plan.limit = int(edit.get("value", 100))
+                logger.debug(f"[PLAN EDIT] Set limit to {updated_plan.limit}")
+            
+            elif op == "set_offset":
+                # Set OFFSET
+                updated_plan.offset = int(edit.get("value", 0))
+                logger.debug(f"[PLAN EDIT] Set offset to {updated_plan.offset}")
+            
+            elif op == "add_order_by":
+                # Add ORDER BY
+                field = OrderByField(
+                    column=edit.get("column"),
+                    direction=OrderDirection(edit.get("direction", "ASC"))
+                )
+                updated_plan.order_by.append(field)
+                direction_val = field.direction.value if hasattr(field.direction, 'value') else str(field.direction)
+                logger.debug(f"[PLAN EDIT] Added order by: {field.column} {direction_val}")
+            
+            elif op == "set_group_by":
+                # Set GROUP BY (replaces existing)
+                updated_plan.group_by = edit.get("columns", [])
+                logger.debug(f"[PLAN EDIT] Set group by: {updated_plan.group_by}")
+            
+            elif op == "set_distinct":
+                # Set DISTINCT
+                updated_plan.distinct = edit.get("value", True)
+                logger.debug(f"[PLAN EDIT] Set distinct to {updated_plan.distinct}")
+            
+            else:
+                logger.warning(f"[PLAN EDIT] Unknown operation: {op}")
+        
+        logger.info(f"[PLAN EDITS] Applied {len(edits)} edits to plan")
+        return updated_plan
 
 
 async def create_semantic_orchestrator(

@@ -14,6 +14,7 @@ Impact: Eliminates ~70% of hallucinated SQL by grounding the model in reality.
 """
 
 import logging
+import re
 from typing import Dict, List, Optional, Set, Tuple, Any
 from sqlalchemy import inspect, MetaData, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -138,12 +139,18 @@ class SchemaGroundingContext:
 
     async def _populate_sample_values(self, session: AsyncSession, limit: int = 10) -> None:
         """Fetch DISTINCT values for frequently-filtered columns."""
-        # Key columns to sample
-        sample_columns = {
-            "card_type", "account_type", "loan_type", "txn_type",
-            "status", "category", "type", "currency",
-            "account_no", "customer_code", "branch_code"
-        }
+        # Pattern-based column detection instead of hardcoded column names
+        # Columns matching these patterns are likely to need sample values
+        sample_patterns = [
+            r'.*_type$',        # Columns ending with _type (e.g., status_type, account_type)
+            r'.*_status$',      # Columns ending with _status
+            r'^status$',        # Exact match for 'status'
+            r'^type$',          # Exact match for 'type'
+            r'^category$',      # Exact match for 'category'
+            r'.*_code$',        # Columns ending with _code (e.g., entity_code, branch_code)
+            r'.*_no$',          # Columns ending with _no (e.g., account_no)
+            r'^currency$',      # Exact match for 'currency'
+        ]
 
         for table_name, table_info in self.tables.items():
             for col_name, col_info in table_info["columns"].items():
@@ -151,8 +158,9 @@ class SchemaGroundingContext:
                 if col_name in ["id", "_id"] or "binary" in col_info["type"].lower():
                     continue
 
-                # Only sample if it's an enum or in our key columns
-                if not (col_info["is_enum"] or col_name in sample_columns):
+                # Check if column matches any sample pattern or is an enum
+                matches_pattern = any(re.match(pattern, col_name, re.IGNORECASE) for pattern in sample_patterns)
+                if not (col_info["is_enum"] or matches_pattern):
                     continue
 
                 try:
@@ -188,8 +196,8 @@ class SchemaGroundingContext:
         Generate a compact, LLM-friendly schema snapshot for the prompt.
         
         Format:
-            genai.customers(customer_id PK, customer_code, email)
-            genai.cards(card_id PK, customer_id FK→customers, type ENUM[CREDIT,DEBIT])
+            schema.table_a(id PK, code, email)
+            schema.table_b(id PK, table_a_id FK→table_a, status ENUM[VALUE_A,VALUE_B])
             ...
         
         Returns:

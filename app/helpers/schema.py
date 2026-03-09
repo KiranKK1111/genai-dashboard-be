@@ -101,23 +101,26 @@ async def get_database_schema(session: AsyncSession) -> str:
                         sample_result = await session.execute(sample_query)
                         samples = [str(row[0]) for row in sample_result.fetchall()]
                         if samples:
-                            # Infer column purpose based on name and sample values
+                            # Infer column purpose dynamically from name patterns
+                            # NO HARDCODED DOMAIN KEYWORDS - use generic patterns
                             col_lower = col_name.lower()
                             purpose = ""
-                            if any(keyword in col_lower for keyword in ['cust', 'customer', 'client']):
-                                purpose = "Customer identifier"
-                            elif any(keyword in col_lower for keyword in ['merchant', 'vendor', 'seller']):
-                                purpose = "Merchant/Vendor identifier"
-                            elif any(keyword in col_lower for keyword in ['txn', 'transaction', 'trans']):
-                                purpose = "Transaction identifier"
-                            elif any(keyword in col_lower for keyword in ['amount', 'value', 'price', 'cost']):
+                            
+                            # Generic pattern-based purpose inference
+                            if col_lower.endswith('_id') or col_lower == 'id':
+                                purpose = "Identifier/foreign key"
+                            elif any(p in col_lower for p in ['amount', 'value', 'price', 'cost', 'total', 'sum']):
                                 purpose = "Amount/monetary value"
-                            elif any(keyword in col_lower for keyword in ['time', 'date', 'created', 'timestamp']):
+                            elif any(p in col_lower for p in ['time', 'date', 'created', 'updated', 'timestamp', '_at']):
                                 purpose = "Date/time information"
-                            elif any(keyword in col_lower for keyword in ['status', 'state', 'type']):
+                            elif any(p in col_lower for p in ['status', 'state', 'type', 'category', 'kind']):
                                 purpose = "Status/classification"
-                            elif any(keyword in col_lower for keyword in ['name', 'title', 'description']):
+                            elif any(p in col_lower for p in ['name', 'title', 'description', 'label']):
                                 purpose = "Name/description"
+                            elif any(p in col_lower for p in ['is_', 'has_', 'can_', 'flag', 'active', 'enabled']):
+                                purpose = "Boolean flag"
+                            elif any(p in col_lower for p in ['email', 'phone', 'address', 'url', 'link']):
+                                purpose = "Contact/reference information"
                             
                             sample_str = ', '.join(samples[:3])
                             if purpose:
@@ -166,56 +169,36 @@ async def get_database_schema(session: AsyncSession) -> str:
             
             schema_description += "\n"
         
-        # Add entity mapping guide to help LLM match search criteria to actual columns
+        # Add generic guidance for LLM (no hardcoded table/column names)
         schema_description += "\n" + "="*70 + "\n"
-        schema_description += "ENTITY MAPPING GUIDE - INTELLIGENT ENTITY MATCHING:\n"
+        schema_description += "SQL GENERATION GUIDELINES:\n"
         schema_description += "="*70 + "\n"
         schema_description += """
-CRITICAL: Use ACTUAL column names from the schema above (marked with ***)
+CRITICAL RULES:
 
-REAL COLUMN NAME MAPPING FOR COMMON SEARCHES:
+1. USE ACTUAL COLUMN NAMES from the schema above (marked with *** ***)
+   - If schema shows *** txn_id ***, use 'txn_id' NOT 'transaction_id'
+   - If schema shows *** first_name ***, use 'first_name' NOT 'name'
+   - Always match exact column names from the discovered schema
 
-1. TRANSACTION SEARCHES - Use ACTUAL transaction table columns:
-   - Transaction ID: use 'txn_id' (NOT transaction_id)
-   - Transaction Time: use 'txn_time' (NOT transaction_time)
-   - Transaction Type: use 'txn_type'
-   - Customer in transaction: use 'customer_id'
-   - Amount: use 'amount'
-   - Merchant: use 'merchant_id'
-   Example SQL: SELECT t.txn_id, t.amount, t.txn_time FROM transactions t 
-                WHERE t.customer_id = 1868 ORDER BY t.txn_time DESC
+2. EXTRACT VALUES FROM USER QUERY:
+   - When user provides a specific value, use it EXACTLY in the WHERE clause
+   - Example: If user says "show records for ABC123", use WHERE col = 'ABC123'
+   - NEVER use placeholder text like '[VALUE]' or '[EXTRACT_FROM_USER_QUERY]'
 
-2. CUSTOMER SEARCHES - Use ACTUAL customer table columns:
-   - Customer Code (the CUST#### format): use 'customer_code' (NOT customer_id)
-   - Customer ID (numeric): use 'customer_id'
-   - Name: use 'first_name' or 'last_name'
-   - Email: use 'email'
-   - Phone: use 'phone'
-   CRITICAL: Extract the exact value from the user query and use it directly
-   Example: If user says "customer CUST0000001", extract "CUST0000001" and use it
-   Correct: SELECT c.customer_code, c.first_name, c.email FROM customers c 
-            WHERE c.customer_code = 'CUST0000001'
-   Wrong: SELECT c.customer_code, c.first_name, c.email FROM customers c 
-          WHERE c.customer_code = '[PLACEHOLDER]'
+3. USE FOREIGN KEYS FOR JOINS:
+   - Check the Foreign Keys section shown above for each table
+   - Join tables using the exact FK relationships discovered
+     - Example: If FK shows "entity_id -> entities.id", use:
+         JOIN entities e ON main_table.entity_id = e.id
 
-3. JOINING TABLES - Match actual foreign keys:
-   - To find transactions for a customer with a specific code:
-     a) Find customer_id by looking up in customers table using their code
-     b) Join transactions on customer_id
-     c) Use the EXACT customer code from the user query in the WHERE clause
-   Example: If user says "customer CUST0000001", do this:
-            SELECT t.txn_id, t.amount, t.txn_time 
-            FROM transactions t 
-            JOIN customers c ON t.customer_id = c.customer_id 
-            WHERE c.customer_code = 'CUST0000001'  ← Use the actual value from user input
-
-KEY RULE: Always use the actual column names shown above (txn_id, txn_time, customer_code, etc.)
-Do NOT use generic names like transaction_id or transaction_time - they don't exist!
-Do NOT use placeholder text like [EXTRACT_FROM_USER_QUERY] - extract and use the REAL value!
+4. FILTERING PATTERNS:
+   - For identifier columns (ending in _id, _code, _no): use exact matching (=)
+   - For text columns: use LIKE with wildcards if doing partial match
+   - For date columns: use appropriate date comparisons
 
 The schema shown above with *** *** around column names shows EXACTLY what columns exist.
 Use those exact names without modification.
-When user provides a specific value (like CUST0000001), always use that exact value in the WHERE clause.
 """
         schema_description += "="*70 + "\n"
         

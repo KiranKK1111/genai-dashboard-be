@@ -52,10 +52,11 @@ class ColumnMetadata:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
+        abstract_type_val = self.abstract_type.value if hasattr(self.abstract_type, 'value') else str(self.abstract_type)
         return {
             "name": self.name,
             "data_type": self.data_type,
-            "abstract_type": self.abstract_type.value,
+            "abstract_type": abstract_type_val,
             "nullable": self.nullable,
             "is_primary_key": self.is_primary_key,
             "is_foreign_key": self.is_foreign_key,

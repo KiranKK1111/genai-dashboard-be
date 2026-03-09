@@ -260,7 +260,8 @@ class SemanticSchemaCatalog:
         Find most relevant tables for user query.
         
         Returns list of (table, confidence_score) tuples.
-        Uses keyword matching and semantic scoring.
+        Uses keyword matching and semantic scoring - NO HARDCODED SYNONYMS.
+        LLM handles synonym understanding during query plan generation.
         """
         import re
         scores: Dict[str, float] = {}
@@ -268,7 +269,7 @@ class SemanticSchemaCatalog:
         query_words = set(re.findall(r'\b\w+\b', query_lower))  # Extract individual words
         
         for table_name, table_meta in self.tables.items():
-            # Keyword matching
+            # Keyword matching - direct matches only, LLM handles synonyms
             score = 0.0
             table_name_lower = table_name.lower()
             
@@ -277,7 +278,7 @@ class SemanticSchemaCatalog:
                 score += 0.8
             
             # Plural/singular matching: check if singular form of table matches query
-            # E.g., "cards" table matches "card" in query
+            # E.g., plural table name matches singular query term
             singular_table = table_name_lower.rstrip('s')  # Simple pluralization removal
             if singular_table != table_name_lower and singular_table in query_lower:
                 score += 0.75  # Slightly lower than exact match
@@ -426,7 +427,10 @@ class SemanticSchemaCatalog:
     
     @staticmethod
     def _infer_column_needs(query: str) -> set:
-        """Infer what types of columns this query needs."""
+        """Infer what types of columns this query needs.
+        
+        Uses generic query patterns, not domain-specific keywords.
+        """
         needs = set()
         
         if any(x in query for x in ['when', 'date', 'time', 'last', 'first']):
@@ -435,10 +439,11 @@ class SemanticSchemaCatalog:
         if any(x in query for x in ['total', 'sum', 'count', 'average', 'how much']):
             needs.add(ColumnType.METRIC)
         
-        if any(x in query for x in ['which', 'where', 'status']):
+        if any(x in query for x in ['which', 'where', 'status', 'type', 'kind']):
             needs.add(ColumnType.CATEGORICAL)
         
-        if any(x in query for x in ['customer', 'person', 'thing']):
+        # Generic identifier detection - look for "the X" or "this X" patterns
+        if any(x in query for x in ['the', 'this', 'that', 'specific', 'particular']):
             needs.add(ColumnType.IDENTIFIER)
         
         return needs

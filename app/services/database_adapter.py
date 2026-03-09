@@ -622,6 +622,11 @@ class PostgreSQLAdapter(DatabaseAdapter):
                 enum_map[enum_name] = list(enum_values)
             return enum_map
         except Exception as e:
+            # ✅ Rollback on error to prevent transaction cascade failures
+            try:
+                await session.rollback()
+            except:
+                pass
             logger.warning(f"Failed to get enum values for schema {schema_name}: {e}")
             return {}
     

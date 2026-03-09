@@ -25,7 +25,7 @@ def _extract_query_identifiers(query: str) -> List[Dict[str, str]]:
     """
     Extract identifiers (IDs, codes) from query using generic pattern matching.
     
-    Replaces hardcoded customer_code logic with generic identifier detection.
+    Replaces legacy domain-specific identifier logic with generic identifier detection.
     Detects patterns like: CUST123, INV456, ACC789, etc.
     
     Returns:
@@ -56,7 +56,7 @@ async def generate_sql_with_analysis(
     query: str, 
     session: AsyncSession, 
     conversation_history: str = "",
-    force_join: bool = False,  # Force JOIN with customers table if true
+    force_join: bool = False,  # Legacy: force JOIN when clarification implies related entities
     followup_context = None,  # Optional FollowUpContext from followup_manager
     semantic_context = None,  # Optional SemanticQueryResult from semantic orchestrator (NEW - FOR SEMANTIC PIPELINE)
 ) -> Tuple[str, Optional[str]]:
@@ -83,7 +83,7 @@ async def generate_sql_with_analysis(
     if is_confirmation:
         print(f"[CONFIRMATION] User confirmed with: '{query}'")
     
-    # Extract identifiers from the query (GENERIC approach, not hardcoded customer_code)
+    # Extract identifiers from the query (GENERIC approach, not hardcoded domain-specific codes)
     # This detects patterns like CUST0001, INV123, ACC456, etc. without hardcoding specific prefixes
     extracted_identifiers = _extract_query_identifiers(query)
     if extracted_identifiers:
@@ -119,7 +119,7 @@ async def generate_sql(query: str, session: AsyncSession, conversation_history: 
     Returns:
         A SQL SELECT statement as a string
     """
-    # CRITICAL: Extract identifiers (GENERIC approach, not hardcoded like customer_code)
+    # CRITICAL: Extract identifiers (GENERIC approach, not hardcoded like entity_code)
     # This detects CUST123, INV456, etc. without hardcoding specific prefixes
     extracted_ids = _extract_query_identifiers(query)
     identifiers_context = ""
@@ -222,16 +222,12 @@ Available tables: {table_names_str}
 User query: "{query}"
 
 CRITICAL DISTINCTION:
-- "credit card customers" = User wants CUSTOMERS data (not cards) → return: customers
-- "card details with CREDIT type" = User wants CARDS data → return: cards
-- "transactions by customer" = User wants TRANSACTIONS data → return: transactions
-- "customer with most transactions" = User wants CUSTOMERS data (joined with transactions) → return: customers
+- Identify WHAT ENTITY the user is asking about, not just what filters they mention.
+- If the user asks about "X with Y", usually they want X data, filtered by Y.
+- If the user asks to "find X" or "show X" or "list X", return the table that matches X.
 
 KEY RULE: What does the user want to SEE/GET/FIND IN THE RESULT?
-  - If "customers" or "details about people" → customers
-  - If "card information" or "card details" → cards
-  - If "transaction records" → transactions
-  - If "account info" → accounts
+Look at the subject of the query and match it to the most semantically similar table name.
 
 Your response MUST be EXACTLY ONE table name from the list above. Nothing else.
 Return ONLY the table name. No explanation."""
@@ -261,12 +257,12 @@ Return ONLY the table name. No explanation."""
             matched_table = table_names_lower[detected_table]
             print(f"[DYNAMIC] ✅ Exact match found: {matched_table}")
         
-        # 2. Try adding 's' for pluralization (card → cards)
+        # 2. Try adding 's' for pluralization (entity → entities)
         elif detected_table + 's' in table_names_lower:
             matched_table = table_names_lower[detected_table + 's']
             print(f"[DYNAMIC] ✅ Pluralization match found: {detected_table} → {matched_table}")
         
-        # 3. Try removing 's' for singularization (transactions → transaction)
+        # 3. Try removing 's' for singularization (entities → entity)
         elif detected_table.endswith('s') and detected_table[:-1] in table_names_lower:
             matched_table = table_names_lower[detected_table[:-1]]
             print(f"[DYNAMIC] ✅ Singularization match found: {detected_table} → {matched_table}")
@@ -374,18 +370,17 @@ Return ONLY the table name. No explanation."""
         "1. WHERE CLAUSE - CRITICAL LOGIC:\n"
         "   USE WHERE if: User mentions ANY specific value, filter, or characteristic\n"
         "   ► IMPORTANT: 'show all X' where X is a FILTER = needs WHERE, not DISTINCT\n"
-        "      Examples of filters: 'debit', 'credit', 'active', 'NY', 'visa', 'status'\n"
         "   ► ONLY use DISTINCT (no WHERE) if asking for UNIQUE VALUES of a single column\n"
         "   \n"
-        "   Filter Examples (USE WHERE):\n"
-        "   - 'show all debit cards' → WHERE card_type = 'DEBIT' (debit is the filter)\n"
-        "   - 'get active customers' → WHERE status = 'ACTIVE' (active is the filter)\n"
-        "   - 'show cards from NY' → WHERE state = 'NY'\n"
+        "   Filter Pattern (USE WHERE):\n"
+        "   - 'show all [type] [entity]' → WHERE type_column = 'TYPE_VALUE' (type is the filter)\n"
+        "   - 'get [status] [entity]' → WHERE status = 'STATUS_VALUE' (status is the filter)\n"
+        "   - 'show [entity] from [location]' → WHERE location_column = 'LOCATION'\n"
         "   \n"
-        "   Non-Filter Examples (NO WHERE, use DISTINCT):\n"
-        "   - 'what are all card networks' → SELECT DISTINCT network (asking for list of values)\n"
-        "   - 'get all different statuses' → SELECT DISTINCT status\n"
-        "   - 'show me all available networks' → SELECT DISTINCT network\n\n"
+        "   Non-Filter Pattern (NO WHERE, use DISTINCT):\n"
+        "   - 'what are all [column_name]' → SELECT DISTINCT column_name (asking for list of values)\n"
+        "   - 'get all different [column_name]' → SELECT DISTINCT column_name\n"
+        "   - 'show me all available [column_name]' → SELECT DISTINCT column_name\n\n"
         
         "2. DISTINCT:\n"
         "   USE DISTINCT ONLY if:\n"
@@ -393,33 +388,33 @@ Return ONLY the table name. No explanation."""
         "   b) NOT asking for filtered records\n"
         "   c) NOT selecting entire rows (*)\n"
         "   \n"
-        "   Valid DISTINCT queries:\n"
-        "   - 'what are all the networks' → SELECT DISTINCT network FROM cards\n"
-        "   - 'show the different statuses' → SELECT DISTINCT status FROM orders\n"
-        "   - 'list all card types' → SELECT DISTINCT card_type FROM cards\n"
+        "   Valid DISTINCT queries (pattern-based):\n"
+        "   - 'what are all the [column]' → SELECT DISTINCT column FROM table\n"
+        "   - 'show the different [column]' → SELECT DISTINCT column FROM table\n"
+        "   - 'list all [column] values' → SELECT DISTINCT column FROM table\n"
         "   \n"
         "   DO NOT use DISTINCT if:\n"
-        "   - User mentions a filter/criterion: 'debit', 'active', location, status value\n"
+        "   - User mentions a filter/criterion: any type, status, location, or value\n"
         "   - User asks for full records: 'show me', 'get details', 'list records'\n"
         "   - Any WHERE condition could apply\n\n"
         
         "3. LIMIT:\n"
         "   DEFAULT SAFETY LIMIT: If not specified by LLM, a safety validator will add LIMIT 500\n"
         "   USE EXPLICIT LIMIT ONLY if: User explicitly asks for 'top N', 'first N', 'limit N', or specific count\n"
-        "   Keywords that trigger LIMIT: 'top 10', 'limit 5', 'first 20', 'show me 5', 'get top', 'last 3'\n"
+        "   Keywords that trigger LIMIT: 'top N', 'limit N', 'first N', 'show me N', 'get top', 'last N'\n"
         "   DO NOT add LIMIT: for 'all', 'list', 'get', 'show' without a specific number\n"
-        "   Examples:\n"
-        "   - 'top 10 customers' → ... LIMIT 10\n"
-        "   - 'get all cards' → NO LIMIT (validator will add default LIMIT 500)\n"
-        "   - 'first 5 transactions' → ... LIMIT 5\n"
-        "   - 'show all debit cards' → NO LIMIT (validator will add default LIMIT 500)\n\n"
+        "   Pattern examples:\n"
+        "   - 'top N [entity]' → ... LIMIT N\n"
+        "   - 'get all [entity]' → NO LIMIT (validator will add default LIMIT 500)\n"
+        "   - 'first N [entity]' → ... LIMIT N\n"
+        "   - 'show all [type] [entity]' → NO LIMIT (validator will add default LIMIT 500)\n\n"
         
         "4. COUNT(*) vs SELECT *:\n"
         "   USE COUNT(*) if: User asks 'how many', 'count', 'total', 'number of'\n"
         "   USE SELECT * if: User asks for 'details', 'show', 'get me', 'display', 'list', or full records\n"
-        "   Examples:\n"
-        "   - 'how many cards' → SELECT COUNT(*) FROM cards\n"
-        "   - 'show me card details' → SELECT * FROM cards\n\n"
+        "   Pattern examples:\n"
+        "   - 'how many [entity]' → SELECT COUNT(*) FROM table\n"
+        "   - 'show me [entity] details' → SELECT * FROM table\n\n"
         
         "5. GROUP BY & ORDER BY:\n"
         "   GROUP BY: Only if user asks for 'group', 'grouped by', 'per', 'each', or 'summary'\n"
@@ -431,24 +426,24 @@ Return ONLY the table name. No explanation."""
         
         "   USE SELECT * when:\n"
         "   - User asks for 'details', 'all details', 'information', 'full record', 'complete data'\n"
-        "   - User asks for 'all [entity]' like 'all customers', 'all cards', 'all accounts'\n"
+        "   - User asks for 'all [entity]' like 'all records', 'all items', 'all entries'\n"
         "   - User wants comprehensive data regardless of filters applied\n"
-        "   - Examples: 'get all customer details' → SELECT * FROM customers\n"
-        "              'show me all credit card customers' → SELECT * FROM customers WHERE ...\n"
-        "              'get complete information about cards' → SELECT * FROM cards\n\n"
+        "   - Pattern: 'get all [entity] details' → SELECT * FROM table\n"
+        "             'show me all [type] [entity]' → SELECT * FROM table WHERE ...\n"
+        "             'get complete information about [entity]' → SELECT * FROM table\n\n"
         
         "   USE SPECIFIC COLUMNS when:\n"
-        "   - User asks for one/few specific fields: 'name', 'email', 'balance'\n"
-        "   - User asks for UNIQUE VALUES: 'what are all card networks' → SELECT DISTINCT network\n"
-        "   - Example: 'get customer names' → SELECT name FROM customers (NOT all columns)\n\n"
+        "   - User asks for one/few specific fields by name\n"
+        "   - User asks for UNIQUE VALUES: 'what are all [column]' → SELECT DISTINCT column\n"
+        "   - Pattern: 'get [entity] [column]' → SELECT column FROM table (NOT all columns)\n\n"
         
         "   RULE: 'all X' referring to entity records with optional filter = ALL COLUMNS\n"
         "   RULE: 'all X' referring to unique values of a property = DISTINCT + specific column\n"
-        "   Examples:\n"
-        "   - WRONG: 'list all customer names' with SELECT id, name, email, phone (over-selection)\n"
-        "   - RIGHT: 'list all customer names' with SELECT name FROM customers\n"
-        "   - WRONG: 'show all debit card details' with SELECT card_type, card_number (incomplete)\n"
-        "   - RIGHT: 'show all debit card details' with SELECT * FROM cards WHERE card_type='DEBIT'\n\n"
+        "   Pattern examples:\n"
+        "   - WRONG: 'list all [column]' with SELECT col1, col2, col3 (over-selection)\n"
+        "   - RIGHT: 'list all [column]' with SELECT column FROM table\n"
+        "   - WRONG: 'show all [type] details' with SELECT col1, col2 (incomplete)\n"
+        "   - RIGHT: 'show all [type] details' with SELECT * FROM table WHERE type='VALUE'\n\n"
         
         f"{grounding_constraints}"
         f"DATABASE SCHEMA:\n{schema_for_prompt}\n\n"
@@ -465,7 +460,7 @@ Return ONLY the table name. No explanation."""
         "• First character MUST be: S (from SELECT)\n"
         "• COLUMN MINIMIZATION: Generate SELECT with minimum necessary columns\n"
         "  - Do NOT select all table columns; choose only what's relevant\n"
-        "  - 'show names' = SELECT name (not SELECT id, name, email, phone)\n"
+        "  - 'show [column]' = SELECT column (not SELECT all columns)\n"
         "  - 'get details' = SELECT * (all fields are relevant)\n"
     )
     
@@ -521,7 +516,31 @@ Return ONLY the table name. No explanation."""
         semantic_guidance += "STRATEGY: Prioritize tables and columns from above when building SQL.\n\n"
         system_prompt += semantic_guidance
     
-    # Extract ANY mentioned values from the query (not just customer code)
+    # NEW: Add intelligently discovered value-to-column mappings (from intelligent_followup_value_mapper)
+    if followup_context and hasattr(followup_context, 'value_mappings') and followup_context.value_mappings:
+        print(f"[SQL_GEN] 🧠 Applying {len(followup_context.value_mappings)} discovered value-to-column mappings")
+        value_mappings_guidance = "\n╔════════════════════════════════════════════════════════════════════╗\n"
+        value_mappings_guidance += "║    INTELLIGENTLY DISCOVERED VALUE-TO-COLUMN MAPPINGS               ║\n"
+        value_mappings_guidance += "║    (Automatically found from user query and database analysis)       ║\n"
+        value_mappings_guidance += "╚════════════════════════════════════════════════════════════════════╝\n\n"
+        
+        for i, mapping in enumerate(followup_context.value_mappings[:5], 1):  # Show top 5 mappings
+            user_val = mapping.get('user_value', '?')
+            col_name = mapping.get('column', '?')
+            confidence = mapping.get('confidence', 0)
+            strategy = mapping.get('strategy', 'unknown')
+            reasoning = mapping.get('reasoning', 'Intelligent discovery')
+            
+            value_mappings_guidance += f"{i}. User value '{user_val}' → Column '{col_name}'\n"
+            value_mappings_guidance += f"   Confidence: {confidence:.0%} | Strategy: {strategy}\n"
+            value_mappings_guidance += f"   Reasoning: {reasoning}\n\n"
+        
+        value_mappings_guidance += "INSTRUCTION: Use these mappings to build accurate WHERE clauses.\n"
+        value_mappings_guidance += "These values have been intelligently discovered and matched to columns.\n\n"
+        
+        system_prompt += value_mappings_guidance
+    
+    # Extract ANY mentioned values from the query (not just a domain-specific code)
     # This helps LLM use the actual user values, not example values
     mentioned_values = []
     
@@ -558,7 +577,8 @@ Return ONLY the table name. No explanation."""
             from .query_plan_generator import ColumnSelectionIntent
             
             print(f"\n[SEMANTIC] ✅ Using LLM-determined column selection from plan:")
-            print(f"  Intent: {column_selection_intent.intent.value}")
+            intent_val = column_selection_intent.intent.value if hasattr(column_selection_intent.intent, 'value') else str(column_selection_intent.intent)
+            print(f"  Intent: {intent_val}")
             print(f"  Reasoning: {column_selection_intent.reasoning}")
             print(f"  Confidence: {column_selection_intent.confidence:.2f}\n")
             
@@ -582,76 +602,13 @@ Return ONLY the table name. No explanation."""
             wants_all_columns = True  # Default to all columns for safety
     
   
-    # SEMANTIC INTENT MAPPER: Extract keywords like "debit", "credit" and helps guide the LLM
-    # These are concepts that need to be matched to database values
+    # SEMANTIC INTENT MAPPER: Extract keywords dynamically from user query
+    # No hardcoded domain terms - let LLM infer from schema context
     semantic_keywords = []
     
-    # Card type semantics
-    if any(word in query.lower() for word in ['debit', 'debit card', 'debit_card']):
-        semantic_keywords.append({
-            'keyword': 'debit',
-            'likely_columns': ['card_type', 'network', 'card_subtype'],
-            'likely_values': [],  # Don't hardcode - LLM will use actual DB values from schema
-            'explanation': 'User asked for debit cards - find columns with debit-related data'
-        })
-    
-    if any(word in query.lower() for word in ['credit', 'credit card', 'credit_card']):
-        semantic_keywords.append({
-            'keyword': 'credit',
-            'likely_columns': ['card_type', 'network', 'card_subtype'],
-            'likely_values': [],  # Don't hardcode - LLM will use actual DB values from schema
-            'explanation': 'User asked for credit cards - find columns with credit-related data'
-        })
-    
-    # Status semantics
-    if any(word in query.lower() for word in ['active', 'activated', 'valid', 'valid card']):
-        semantic_keywords.append({
-            'keyword': 'active/valid',
-            'likely_columns': ['status', 'card_status'],
-            'likely_values': [],  # Don't hardcode - LLM will use actual DB values from schema
-            'explanation': 'User asking for active/valid items - look for status values'
-        })
-    
-    if any(word in query.lower() for word in ['inactive', 'inactive', 'blocked', 'closed', 'expired']):
-        semantic_keywords.append({
-            'keyword': 'inactive/blocked',
-            'likely_columns': ['status', 'card_status'],
-            'likely_values': [],  # Don't hardcode - LLM will use actual DB values from schema
-            'explanation': 'User asking for inactive/blocked items - look for status values'
-        })
-    
-    # Card network semantics
-    card_networks = ['visa', 'mastercard', 'rupay', 'amex', 'diners', 'discover']
-    for network in card_networks:
-        if network in query.lower():
-            semantic_keywords.append({
-                'keyword': network,
-                'likely_columns': ['network', 'card_network'],
-                'likely_values': [],  # Don't hardcode - let LLM match to actual schema values
-                'explanation': f'User specifically mentioned {network.upper()} - look for this in network column'
-            })
-    
-    # Amount semantics
-    if any(word in query.lower() for word in ['limit', 'credit limit', 'high limit', 'low limit']):
-        semantic_keywords.append({
-            'keyword': 'limit',
-            'likely_columns': ['credit_limit', 'limit'],
-            'likely_values': [],  # Will be determined from schema ranges
-            'explanation': 'User asking about credit limits - may need numeric comparison'
-        })
-    
-    # Expiry semantics
-    if any(word in query.lower() for word in ['expires', 'expired', 'expiry', 'expiration', 'valid until']):
-        semantic_keywords.append({
-            'keyword': 'expiry',
-            'likely_columns': ['expiry_date', 'expiry_month', 'expiry_year', 'expires_on'],
-            'likely_values': [],
-            'explanation': 'User asking about expiry information'
-        })
-    
-    # Extract 2-letter state/region codes (AP, TG, CA, NY, etc.)
-    state_codes = re.findall(r'\b([A-Z]{2})\b', query)
-    mentioned_values.extend(state_codes)
+    # Dynamic keyword extraction - no domain-specific hardcoding
+    # The LLM will understand user intent from context and schema
+    # Keywords and values are extracted generically and matched against actual database values
     
     # Extract quoted strings (values in quotes)
     quoted = re.findall(r"['\"]([^'\"]+)['\"]", query)
@@ -721,7 +678,8 @@ Return ONLY the table name. No explanation."""
     if followup_context and followup_context.is_followup:
         followup_prompt = followup_context.to_prompt_section()
         if followup_prompt:
-            print(f"[DEBUG] Including follow-up context ({followup_context.followup_type.value})")
+            followup_type_val = followup_context.followup_type.value if hasattr(followup_context.followup_type, 'value') else str(followup_context.followup_type)
+            print(f"[DEBUG] Including follow-up context ({followup_type_val})")
             context_lines.append(followup_prompt)
             context_lines.append("")
     
@@ -830,16 +788,20 @@ Return ONLY the table name. No explanation."""
             dialect_engine = DialectSqlEngine(dialect_name)
             
             # Use the target_table determined by LLM earlier (zero-hardcoding!)
-            # If we couldn't determine it, fall back to generic query
-            fallback_table = target_table or 'transactions'
+            # If we couldn't determine it, we cannot generate fallback
+            if not target_table:
+                print("[WARN] Cannot generate fallback SQL - no target table determined")
+                return "SELECT 1 AS error_no_table_detected"  # Signal error condition
+            
+            fallback_table = target_table
             
             # Build intelligent fallback SQL using dialect-aware qualification
             # Get the configured schema (if applicable for this dialect)
             configured_schema = settings.postgres_schema if hasattr(settings, 'postgres_schema') else None
             
-            # Use generic identifier matching instead of hardcoded customer_code logic
+            # Use generic identifier matching instead of hardcoded entity_code logic
             # This allows filtering by any identifier found in the query
-            if extracted_ids and fallback_table in ['transactions', 'orders']:
+            if extracted_ids:
                 # Try to use first extracted identifier for filtering
                 first_id = extracted_ids[0] if extracted_ids else None
                 if first_id:
@@ -878,7 +840,7 @@ Return ONLY the table name. No explanation."""
         r'^This\s+query.*?:\s*',  # "This query will..." then colon
         r'^Certainly!.*?:\s*',  # "Certainly! Here's the query:" 
         r'^Based\s+on.*?:\s*',  # "Based on the schema..."
-        r'^To\s+(?:fetch|get|retrieve).*?:\s*',  # "To fetch the transactions:"
+        r'^To\s+(?:fetch|get|retrieve).*?:\s*',  # "To fetch the records:"
         r'^\s*\|+\s*',  # Remove leading pipe characters
         r'\n\s*\|+\s*',  # Remove pipes after newlines
         r'^[\s\-]*',  # Remove leading dashes or whitespace
@@ -1100,16 +1062,17 @@ Return ONLY the table name. No explanation."""
     if "[EXTRACT_FROM_USER_QUERY]" in sql:
         print("🔍 Detected [EXTRACT_FROM_USER_QUERY] placeholder - extracting actual value from user query...")
         
-        # Pattern 1: Extract customer codes (CUST0000001, CUST001, etc.)
-        cust_match = re.search(r'\bCUST\d+\b', query, re.IGNORECASE)
-        if cust_match:
-            cust_code = cust_match.group(0)
-            # Replace the placeholder with the actual customer code
-            sql = sql.replace("[EXTRACT_FROM_USER_QUERY]", cust_code)
-            print(f"[OK] Replaced [EXTRACT_FROM_USER_QUERY] with customer code: {cust_code}")
+        # Pattern 1: Extract any alphanumeric code pattern (e.g., ABC123, ITEM001, CODE-456)
+        # Generic pattern that matches common identifier formats without domain assumptions
+        code_match = re.search(r'\b([A-Z]{2,}[-_]?\d+|\d+[-_]?[A-Z]{2,})\b', query, re.IGNORECASE)
+        if code_match:
+            code_value = code_match.group(1)
+            # Replace the placeholder with the actual code
+            sql = sql.replace("[EXTRACT_FROM_USER_QUERY]", code_value)
+            print(f"[OK] Replaced [EXTRACT_FROM_USER_QUERY] with identifier code: {code_value}")
         else:
-            # Pattern 2: Try to extract numeric IDs (customer id CUST0000001 or just 12345)
-            id_match = re.search(r'(?:customer\s+(?:code|id|with\s+id)?)?\s*(\d+)', query, re.IGNORECASE)
+            # Pattern 2: Try to extract numeric IDs
+            id_match = re.search(r'(?:id|code|with\s+id|number)?\s*[:#]?\s*(\d+)', query, re.IGNORECASE)
             if id_match:
                 value = id_match.group(1)
                 sql = sql.replace("[EXTRACT_FROM_USER_QUERY]", value)
@@ -1125,57 +1088,10 @@ Return ONLY the table name. No explanation."""
                     print(f"[WARN] Could not extract value for [EXTRACT_FROM_USER_QUERY] placeholder")
                     print(f"   Query: {query}")
     
-    # CRITICAL FIX: Check if user mentioned customer code but SQL doesn't have JOIN to customers
-    # This catches cases where LLM generates incomplete SQL like "SELECT * FROM transactions LIMIT 10"
-    # when it should generate "SELECT * FROM transactions t JOIN customers c WHERE c.customer_code = 'CUST####'"
-    cust_code_in_query = re.search(r'\bCUST\d+\b', query, re.IGNORECASE)
-    if cust_code_in_query:
-        cust_code = cust_code_in_query.group(0)
-        
-        # Check if SQL has customer code filtering
-        has_customer_filter = cust_code.lower() in sql.lower() or 'customer_code' in sql.lower()
-        
-        if not has_customer_filter:
-            # SQL is missing the customer code filter!
-            print(f"[WARN] WARNING: Query mentions customer {cust_code} but SQL doesn't filter by it!")
-            print(f"   Original SQL: {sql[:100]}...")
-            
-            # Detect database dialect for proper SQL generation
-            bind = session.get_bind()
-            dialect_name = bind.dialect.name if hasattr(bind, 'dialect') else 'postgresql'
-            dialect_engine = DialectSqlEngine(dialect_name)
-            configured_schema = settings.postgres_schema if hasattr(settings, 'postgres_schema') else None
-            
-            # Try to fix by adding the JOIN and WHERE clause
-            # Use dialect-aware table qualification instead of hardcoded 'genai.transactions'
-            transactions_qualified = dialect_engine.qualify_table('transactions', configured_schema)
-            customers_qualified = dialect_engine.qualify_table('customers', configured_schema)
-            
-            if transactions_qualified.lower() in sql.lower() and 'JOIN' not in sql.upper():
-                # Detect what alias is being used for transactions table
-                # Use case-insensitive matching since dialect_engine might quote it
-                trans_table_pattern = re.escape(transactions_qualified)
-                trans_alias_match = re.search(f'FROM\\s+{trans_table_pattern}\\s+(\\w+)', sql, re.IGNORECASE)
-                if trans_alias_match:
-                    t_alias = trans_alias_match.group(1)
-                elif 't.' in sql or 't,' in sql:
-                    t_alias = 't'
-                else:
-                    t_alias = 't'
-                
-                # Add the JOIN and WHERE clause using dialect-qualified table names
-                where_clause = f" JOIN {customers_qualified} c ON {t_alias}.customer_id = c.customer_id WHERE c.customer_code = '{cust_code}'"
-                
-                # Find where to insert (before LIMIT, ORDER, GROUP, etc.)
-                insertion_match = re.search(r'(\s+(?:LIMIT|TOP|ORDER|GROUP|HAVING|FETCH|;|$))', sql, re.IGNORECASE)
-                if insertion_match:
-                    insert_pos = insertion_match.start(1)
-                    sql = sql[:insert_pos] + where_clause + sql[insert_pos:]
-                else:
-                    sql = sql + where_clause
-                
-                print(f"✅ Fixed: Added JOIN and WHERE clause for customer {cust_code}")
-                print(f"   Fixed SQL: {sql[:150]}...")
+    # NOTE: Domain-specific JOIN logic removed - LLM handles semantic understanding
+    # If user mentions an identifier code in their query, the LLM should include
+    # proper JOIN and WHERE clauses in the generated SQL.
+    # Any missing filters should be addressed through prompt engineering, not hardcoded post-processing.
 
     
     return sql

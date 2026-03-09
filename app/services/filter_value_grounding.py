@@ -2,11 +2,11 @@
 PRINCIPLE 2: Value Grounding for Filters
 ==========================================
 Ensure filter predicates use EXACT, VALIDATED values from:
-1. Enum definitions (card_type = 'CREDIT')
+1. Enum definitions (enum_col = 'VALUE')
 2. DISTINCT column samples (account_type IN [...])
-3. User query mentions (if they say "customer 12345", that's valid)
+3. User query mentions (if they say "record 12345", that's valid)
 
-This prevents: card_type = 'INVALID_VALUE' or status = 'SUPER_VIP'
+This prevents: enum_col = 'INVALID_VALUE' or status = 'SUPER_VIP'
 
 Impact: Eliminates enum/predicate errors, reduces 40% of execution failures.
 """
@@ -108,8 +108,8 @@ class FilterValueGrounding:
         Extract potential filter values mentioned by the user.
         
         Examples:
-            "show customers with ID 12345" → {'12345'}
-            "credit card customers" → {'credit', 'card'}
+            "show records with ID 12345" → {'12345'}
+            "premium users" → {'premium', 'users'}
             "AMEX or VISA" → {'AMEX', 'VISA'}
         
         Args:
@@ -133,11 +133,13 @@ class FilterValueGrounding:
         uppercase = re.findall(r"\b[A-Z][A-Z0-9_]*\b", user_query)
         terms.update(uppercase)
         
-        # Common keywords that should NOT be considered values
+        # SQL keywords that should NOT be considered values (generic, not domain-specific)
         stopwords = {
             "SHOW", "SELECT", "WHERE", "AND", "OR", "NOT", "IN", "IS",
             "THE", "A", "AN", "FOR", "WITH", "BY", "FROM", "TO",
-            "CUSTOMER", "CARD", "TRANSACTION", "ACCOUNT", "TABLE"
+            "ALL", "DISTINCT", "ORDER", "GROUP", "HAVING", "LIMIT",
+            "ASC", "DESC", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER",
+            "COUNT", "SUM", "AVG", "MIN", "MAX", "AS", "ON"
         }
         terms -= stopwords
         
@@ -259,7 +261,7 @@ class FilterValueGrounding:
 
         lines.append("\n\nRULE: When generating WHERE predicates:")
         lines.append("  1. ONLY use values from lists above")
-        lines.append("  2. Use = for exact match (card_type = 'CREDIT')")
+        lines.append("  2. Use = for exact match (enum_col = 'VALUE')")
         lines.append("  3. Use IN for multiple (txn_type IN ('TRANSFER_IN', 'TRANSFER_OUT'))")
         lines.append("  4. Never invent values; better to omit than hallucinate")
 
