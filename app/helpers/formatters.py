@@ -248,8 +248,8 @@ def build_messages_with_token_management(
     if include_metadata and messages:
         # Check if there are data query results
         data_query_count = sum(
-            1 for m in messages 
-            if m.response_metadata and m.response_metadata.get("query_type") == "data_query"
+            1 for m in messages
+            if m.response_type == "data_query"
         )
         if data_query_count > 0:
             usage["has_data_context"] = True

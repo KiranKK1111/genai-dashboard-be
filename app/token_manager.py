@@ -146,36 +146,35 @@ class TokenManager:
         history_messages = []
         
         for msg in reversed(conversation_history):
-            # Convert database Message object to LLM message format
-            # User messages have query field, assistant messages have response field
-            if msg.query and msg.responded_at is None:
-                # User message
-                msg_dict = {
-                    "role": "user",
-                    "content": msg.query
-                }
-            elif msg.response and msg.responded_at is not None:
-                # Assistant response
-                content = ""
-                if isinstance(msg.response, dict):
-                    content = msg.response.get("message", "")
-                msg_dict = {
-                    "role": "assistant",
-                    "content": content
-                }
-            else:
-                # Skip ambiguous messages
+            # Only include completed messages (pending placeholders have responded_at=None)
+            if msg.responded_at is None or not msg.query:
                 continue
-                
-            msg_tokens = self.count_message_tokens(msg_dict)
-            
-            if msg_tokens > remaining_tokens:
-                # Can't fit this message - skip rest of older history
+
+            # Each completed Message row represents one full exchange:
+            # first the user's query, then the assistant's reply.
+            # Build both turns so the LLM has proper conversational context.
+
+            # Assistant turn
+            asst_content = ""
+            if isinstance(msg.response, dict):
+                asst_content = msg.response.get("message", "")
+            asst_dict = {"role": "assistant", "content": asst_content or ""}
+            asst_tokens = self.count_message_tokens(asst_dict)
+
+            # User turn
+            user_dict = {"role": "user", "content": msg.query}
+            user_tokens = self.count_message_tokens(user_dict)
+
+            pair_tokens = user_tokens + asst_tokens
+            if pair_tokens > remaining_tokens:
+                # Can't fit this exchange – stop adding older history
                 break
-            
-            history_messages.insert(0, msg_dict)
-            remaining_tokens -= msg_tokens
-            total_tokens += msg_tokens
+
+            # Insert pair in chronological order (user before assistant)
+            history_messages.insert(0, asst_dict)
+            history_messages.insert(0, user_dict)
+            remaining_tokens -= pair_tokens
+            total_tokens += pair_tokens
         
         # Insert history between system and current query
         if history_messages:
