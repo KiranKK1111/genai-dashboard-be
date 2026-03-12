@@ -45,8 +45,14 @@ class QueryEmbeddingStore:
     vector similarity searches. Enables semantic retrieval across sessions.
     """
     
-    def __init__(self, db_session: Optional[AsyncSession] = None, embedding_dim: int = 768):
-        """Initialize embedding store."""
+    def __init__(self, db_session: Optional[AsyncSession] = None, embedding_dim: int = 384):
+        """Initialize embedding store.
+        
+        FIX: Changed default from 768 to 384 to match:
+        - all-MiniLM-L6-v2 model (384 dimensions)
+        - pgvector schema in models.py (Vector(384))
+        - EmbeddingGenerator default (384 dimensions)
+        """
         self.db_session = db_session
         self.embedding_dim = embedding_dim
         # Keep in-memory cache for current session
@@ -69,9 +75,10 @@ class QueryEmbeddingStore:
         column_names: List[str],
         all_result_rows: List[Dict[str, Any]],  # NEW: ALL rows from result set
         embedding: List[float],
+        db_session: Optional[AsyncSession] = None,  # Explicit session (preferred over self.db_session)
     ) -> None:
         """Store a query embedding with ALL result rows from query execution."""
-        print(f"\n[VECTOR STORE] ⏸️ store_embedding() called for: {user_query[:60]}...")
+        print(f"\n[VECTOR STORE] ⏸️ store_embedding() called for: {user_query}")
         print(f"[VECTOR STORE]   query_id: {query_id}")
         print(f"[VECTOR STORE]   session_id: {session_id}")
         print(f"[VECTOR STORE]   result_count: {result_count}")
@@ -90,7 +97,7 @@ class QueryEmbeddingStore:
             created_at=datetime.utcnow(),
         )
         
-        print(f"[VECTOR STORE] Created QueryEmbedding object: {query_emb.query_id[:8]}...")
+        print(f"[VECTOR STORE] Created QueryEmbedding object: {query_emb.query_id}")
         
         self.embeddings[query_id] = query_emb
         print(f"[VECTOR STORE] Added to embeddings dict. Total embeddings now: {len(self.embeddings)}")
@@ -100,44 +107,39 @@ class QueryEmbeddingStore:
         self.session_queries[session_id].append(query_id)
         print(f"[VECTOR STORE] Session {session_id} now has {len(self.session_queries[session_id])} queries")
         
-        # Persist to database if session is available
-        if self.db_session:
+        # Persist to database if a session is available.
+        # Prefer the explicitly-passed db_session over self.db_session to avoid
+        # using a stale/shared request session from a previous call.
+        effective_session = db_session or self.db_session
+        if effective_session:
             try:
                 # Import here to avoid circular imports
                 from app.models import QueryEmbedding as QueryEmbeddingModel
+                from app.helpers import make_json_serializable
                 import uuid
-                from datetime import date
-                
+
                 # Create query hash for duplicate detection
                 query_hash = hashlib.sha256(user_query.encode()).hexdigest()
-                
-                # Convert date/datetime objects to strings for JSON serialization
-                def serialize_for_json(obj):
-                    """Convert non-JSON-serializable objects to strings."""
-                    if isinstance(obj, (date, datetime)):
-                        return obj.isoformat()
-                    elif hasattr(obj, '__dict__'):
-                        return str(obj)
-                    return obj
-                
-                # Serialize all_result_rows by converting dates to ISO strings
+
+                # Serialize all_result_rows using the standard helper (handles Decimal, datetime, etc.)
                 serialized_rows = []
                 for row in all_result_rows:
                     if isinstance(row, dict):
-                        serialized_row = {k: serialize_for_json(v) for k, v in row.items()}
+                        # Use make_json_serializable to handle Decimal, datetime, and other types
+                        serialized_row = {k: make_json_serializable(v) for k, v in row.items()}
                         serialized_rows.append(serialized_row)
                     else:
-                        serialized_rows.append(row)
-                
+                        serialized_rows.append(make_json_serializable(row))
+
                 # Calculate result quality score (0-100 scale)
                 # Based on: embedding sparsity, result coverage, and data completeness
                 non_zero_embeddings = sum(1 for v in embedding if abs(v) > 0.001)
                 sparsity_score = min(100, (non_zero_embeddings / 10))  # 10+ non-zero = 100
-                coverage_score = min(100, (len(serialized_rows) / 100) * 100)  # 100 rows = 100 
+                coverage_score = min(100, (len(serialized_rows) / 100) * 100)  # 100 rows = 100
                 result_quality_score = int((sparsity_score + coverage_score) / 2)  # Average of both factors
-                
+
                 print(f"[VECTOR STORE] Calculated quality score: {result_quality_score} (sparsity: {non_zero_embeddings} non-zero, rows: {len(serialized_rows)})")
-                
+
                 # Create database record
                 db_embedding = QueryEmbeddingModel(
                     id=uuid.UUID(query_id),
@@ -151,18 +153,20 @@ class QueryEmbeddingStore:
                     query_hash=query_hash,
                     result_quality_score=result_quality_score,  # NEW: Store quality score
                 )
-                
-                self.db_session.add(db_embedding)
-                await self.db_session.flush()  # Flush to get the ID without committing
+
+                effective_session.add(db_embedding)
+                await effective_session.flush()  # Flush to get the ID without committing
                 print(f"[VECTOR STORE] Persisted embedding with {len(all_result_rows)} result rows to database")
                 logger.info(f"[VECTOR STORE] Persisted embedding with {len(all_result_rows)} rows: {query_id}")
             except Exception as e:
-                # Proper transaction rollback to prevent "transaction is aborted" errors
-                try:
-                    await self.db_session.rollback()
-                    print(f"[VECTOR STORE] ⚠️ Rolled back transaction after error")
-                except:
-                    pass
+                # Attempt rollback only on the session we own (the background-task session).
+                # Never rollback self.db_session here — it belongs to the caller.
+                if db_session:
+                    try:
+                        await db_session.rollback()
+                        print(f"[VECTOR STORE] ⚠️ Rolled back background session after error")
+                    except Exception:
+                        pass
                 print(f"[VECTOR STORE] ⚠️ Failed to persist to database: {e}")
                 logger.error(f"[VECTOR STORE] Failed to persist embedding: {str(e)}")
                 # Continue anyway - in-memory store works
@@ -184,6 +188,7 @@ class QueryEmbeddingStore:
         query_embedding: List[float],
         top_k: int = 3,
         similarity_threshold: float = 0.6,
+        db_session: Optional[AsyncSession] = None,  # Explicit session (preferred over self.db_session)
     ) -> List[Tuple[QueryEmbedding, float]]:
         """
         Search for semantically similar previous queries.
@@ -215,7 +220,7 @@ class QueryEmbeddingStore:
                 if qid in self.embeddings:
                     embedding = self.embeddings[qid]
                     sim = self._cosine_similarity(query_embedding, embedding.embedding)
-                    print(f"[VECTOR SEARCH] Similarity with '{embedding.user_query[:40]}...': {sim:.3f}")
+                    print(f"[VECTOR SEARCH] Similarity with '{embedding.user_query}': {sim:.3f}")
                     
                     if sim >= similarity_threshold:
                         similarities.append((embedding, sim))
@@ -223,10 +228,11 @@ class QueryEmbeddingStore:
             print(f"[VECTOR SEARCH] No in-memory queries found for session: {session_id}")
         
         # 2. Search database for historical queries if available
-        if self.db_session:
+        effective_session = db_session or self.db_session
+        if effective_session:
             try:
                 from app.models import QueryEmbedding as QueryEmbeddingModel
-                
+
                 # Fetch embeddings from database
                 # Note: Using JSON embeddings which are stored as regular JSON in the database
                 # Similarity search is done in Python using cosine distance
@@ -234,11 +240,11 @@ class QueryEmbeddingStore:
                     QueryEmbeddingModel.created_at.desc()
                 ).limit(top_k * 10)  # Get more to filter by threshold
                 
-                result = await self.db_session.execute(stmt)
+                result = await effective_session.execute(stmt)
                 db_embeddings = result.scalars().all()
-                
+
                 print(f"[VECTOR SEARCH] Found {len(db_embeddings)} potential matches in database")
-                
+
                 for db_emb in db_embeddings:
                     # Ensure embedding is a list (JSON may return it as list or dict)
                     emb_data = db_emb.embedding
@@ -267,7 +273,7 @@ class QueryEmbeddingStore:
                     )
                     
                     sim = self._cosine_similarity(query_embedding, qe.embedding)
-                    print(f"[VECTOR SEARCH] DB match - '{qe.user_query[:40]}...': {sim:.3f}")
+                    print(f"[VECTOR SEARCH] DB match - '{qe.user_query}': {sim:.3f}")
                     
                     # Avoid duplicates with in-memory results
                     if not any(e[0].query_id == qe.query_id for e in similarities):
@@ -346,7 +352,7 @@ class QueryEmbeddingStore:
                 sim = self._cosine_similarity(query_embedding, qe.embedding)
                 if sim >= similarity_threshold:
                     similarities.append((qe, sim))
-                    print(f"[VECTOR SEARCH] Cross-session match: '{qe.user_query[:50]}...' (sim: {sim:.3f})")
+                    print(f"[VECTOR SEARCH] Cross-session match: '{qe.user_query}' (sim: {sim:.3f})")
             
             # Sort by similarity descending and return top_k
             similarities.sort(key=lambda x: x[1], reverse=True)
@@ -365,9 +371,12 @@ class QueryEmbeddingStore:
         query_ids = self.session_queries[session_id]
         return [self.embeddings[qid] for qid in query_ids if qid in self.embeddings]
     
-    async def get_session_history_from_db(self, session_id: str) -> List[QueryEmbedding]:
+    async def get_session_history_from_db(
+        self, session_id: str, db_session: Optional[AsyncSession] = None
+    ) -> List[QueryEmbedding]:
         """Get chronological history of queries from the database."""
-        if not self.db_session:
+        effective_session = db_session or self.db_session
+        if not effective_session:
             return []
         
         try:
@@ -377,10 +386,10 @@ class QueryEmbeddingStore:
             stmt = select(QueryEmbeddingModel).where(
                 QueryEmbeddingModel.session_id == uuid.UUID(session_id)
             ).order_by(QueryEmbeddingModel.created_at)
-            
-            result = await self.db_session.execute(stmt)
+
+            result = await effective_session.execute(stmt)
             db_embeddings = result.scalars().all()
-            
+
             return [
                 QueryEmbedding(
                     query_id=str(db_emb.id),
@@ -535,7 +544,7 @@ class EmbeddingGenerator:
             lambda: self._hash_to_vector(combined_text, self.dim)
         )
         
-        logger.info(f"[EMBEDDINGS] Generated {self.dim}d embedding for: {query[:40]}...")
+        logger.info(f"[EMBEDDINGS] Generated {self.dim}d embedding for: {query}")
         return embedding.tolist() if hasattr(embedding, 'tolist') else embedding
     
 
@@ -548,22 +557,24 @@ _embedding_generator: Optional[EmbeddingGenerator] = None
 async def get_embedding_store(db_session: Optional[AsyncSession] = None) -> QueryEmbeddingStore:
     """
     Get or create the global embedding store.
-    
+
+    NOTE: db_session is intentionally NOT stored on the singleton here.
+    Pass db_session directly to store_embedding() / search_similar_queries()
+    so each caller uses its own session and never corrupts a shared one.
+
     Args:
-        db_session: Optional database session for persistence
-        
+        db_session: Deprecated — kept for signature compatibility; ignored.
+
     Returns:
         Global QueryEmbeddingStore instance
     """
     global _embedding_store
     if _embedding_store is None:
         print(f"[VECTOR STORE] Creating new global embedding store instance")
-        _embedding_store = QueryEmbeddingStore(db_session=db_session)
+        # Do not inject db_session — callers pass it per-operation
+        _embedding_store = QueryEmbeddingStore()
     else:
         print(f"[VECTOR STORE] Reusing existing global embedding store (id: {id(_embedding_store)}, has {len(_embedding_store.embeddings)} embeddings)")
-        # Update database session if provided
-        if db_session and not _embedding_store.db_session:
-            _embedding_store.set_db_session(db_session)
     return _embedding_store
 
 

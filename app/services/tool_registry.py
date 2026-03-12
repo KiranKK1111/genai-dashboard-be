@@ -102,7 +102,7 @@ class SQLExecutorTool(BaseTool):
             or ""
         )
         
-        logger.info(f"[SQL EXECUTOR TOOL] Executing query: {query[:100]}...")
+        logger.info(f"[SQL EXECUTOR TOOL] Executing query: {query}")
         
         try:
             # Use existing query handler
@@ -178,7 +178,7 @@ class FileReaderTool(BaseTool):
         query = parameters.get("query") or context.get("user_query") or ""
         session_id = parameters.get("session_id") or context.get("session_id") or "orchestrator"
         
-        logger.info(f"[FILE READER TOOL] Reading files for query: {query[:100]}...")
+        logger.info(f"[FILE READER TOOL] Reading files for query: {query}")
         
         try:
             # Retrieve file chunks
@@ -380,7 +380,7 @@ class VectorSearchTool(BaseTool):
         query = parameters.get("query") or context.get("user_query") or ""
         session_id = parameters.get("session_id") or context.get("session_id") or "orchestrator"
         
-        logger.info(f"[VECTOR SEARCH TOOL] Searching: {query[:100]}...")
+        logger.info(f"[VECTOR SEARCH TOOL] Searching: {query}")
         
         try:
             retriever = RAGContextRetriever(db_session=db_session)

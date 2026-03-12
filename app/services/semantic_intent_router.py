@@ -42,10 +42,16 @@ logger = logging.getLogger(__name__)
 
 class SemanticIntentRouter:
     """
-    Production-ready semantic routing engine.
+    Semantic routing signal generator.
+    
+    NOTE: This router produces PROVISIONAL SIGNALS for the DecisionArbiter.
+    It does NOT make final routing decisions - that authority belongs to the arbiter.
     
     Takes: user_query + session_state
-    Returns: RouterDecision (tool, followup_type, confidence, clarification_questions)
+    Returns: RouterDecision (provisional tool, followup_type, confidence, clarification_questions)
+    
+    The returned decision should be treated as a SIGNAL, not a final decision.
+    DecisionArbiter combines this signal with other signals to make the final call.
     """
     
     def __init__(self, db: AsyncSession):
@@ -305,8 +311,12 @@ Output MUST be valid JSON matching the schema:
             )
             
             decision_json = json.loads(response)
+            # Mark this as a provisional signal (not final decision)
+            decision_json["signals_used"] = decision_json.get("signals_used", {})
+            decision_json["signals_used"]["is_provisional"] = True
+            decision_json["signals_used"]["source"] = "semantic_intent_router"
             decision = schemas.RouterDecision(**decision_json)
-            logger.info(f"Router decision: {decision.tool.value} ({decision.confidence:.2f})")
+            logger.info(f"Router signal: {decision.tool.value} ({decision.confidence:.2f}) [PROVISIONAL]")
             return decision
             
         except Exception as e:
@@ -448,7 +458,13 @@ Return valid JSON."""
             and hard_signals.has_uploaded_files):
             # Check if query is actually about files (not database)
             file_keywords = ["file", "document", "upload", "this", "content", "analyze"]
-            db_keywords = ["clients", "sales", "data", "records", "all", "get me", "show me", "list"]
+            try:
+                from app.services.schema_intelligence_service import get_schema_intelligence as _get_schema_intel
+                _svc = _get_schema_intel()
+                db_keywords = list(_svc.table_profiles.keys()) if _svc.table_profiles else []
+                db_keywords += ["data", "records", "get me", "show me", "list", "all"]
+            except Exception:
+                db_keywords = ["data", "records", "get me", "show me", "list", "all"]
             
             query_lower = user_query.lower()
             has_file_intent = any(kw in query_lower for kw in file_keywords)
@@ -460,11 +476,17 @@ Return valid JSON."""
                 logger.info("Corrected CHAT to ANALYZE_FILE: file-specific query detected")
         
         # Correction 2: RUN_SQL_FOLLOW_UP without last SQL
-        if (decision.followup_type == schemas.FollowupType.RUN_SQL_FOLLOW_UP 
-            and not hard_signals.last_sql_exists):
+        if (decision.followup_type == schemas.FollowupType.RUN_SQL_FOLLOW_UP
+                and not hard_signals.last_sql_exists):
             decision.followup_type = schemas.FollowupType.NEW_QUERY
             decision.followup_subtype = None
-            logger.warning("Corrected RUN_SQL_FOLLOW_UP to NEW_QUERY: no last SQL exists")
+            # Cap confidence when downgrading: the LLM thought this was a follow-up
+            # but there is no prior SQL to anchor to, so we are less certain.
+            decision.confidence = min(decision.confidence, 0.6)
+            logger.warning(
+                "Corrected RUN_SQL_FOLLOW_UP to NEW_QUERY: no last SQL exists "
+                f"(confidence capped at {decision.confidence:.2f})"
+            )
         
         # Correction 3: Low confidence gating
         if decision.confidence < 0.60:

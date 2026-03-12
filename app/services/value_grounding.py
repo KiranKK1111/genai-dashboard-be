@@ -44,7 +44,7 @@ class ValueGrounder:
         self,
         column_path: str,  # e.g., "table.column"
         semantic_value: str,  # e.g., "premium"
-        schema: str = "genai",
+        schema: Optional[str] = None,
     ) -> str:
         """
         Ground a semantic value to actual DB value.
@@ -57,8 +57,10 @@ class ValueGrounder:
         Returns:
             Best matching DB value (quoted and ready for SQL)
         """
+        from app.config import settings as _settings
+        schema = schema or _settings.postgres_schema
         table, column = column_path.split('.')
-        
+
         # Try to probe DB for actual values
         actual_values = await self._probe_column_values(table, column, schema)
         
@@ -77,7 +79,7 @@ class ValueGrounder:
         self,
         table: str,
         column: str,
-        schema: str = "genai",
+        schema: Optional[str] = None,
         limit: int = 50,
     ) -> List[str]:
         """
@@ -92,12 +94,14 @@ class ValueGrounder:
         Returns:
             List of distinct values found in DB (empty if probe fails)
         """
+        from app.config import settings as _settings
+        schema = schema or _settings.postgres_schema
         cache_key = f"{schema}.{table}.{column}"
-        
+
         # Check cache first
         if cache_key in self._cache:
             return self._cache[cache_key]
-        
+
         if not self.db_connector:
             return []
         
@@ -225,12 +229,14 @@ class FilterValueMapper:
                 continue
             
             # Extract schema for this table
+            from app.config import settings as _settings
+            _default_schema = _settings.postgres_schema
             parts = column.split('.')
             if len(parts) == 2:
                 table = parts[0]
-                schema = table_references.get(table, 'genai')
+                schema = table_references.get(table, _default_schema)
             else:
-                schema = 'genai'
+                schema = _default_schema
             
             # Ground the value
             try:

@@ -253,6 +253,7 @@ class SemanticValueGrounderEnhanced:
 
     async def _discover_foreign_keys(self, db: AsyncSession):
         """Discover all FK relationships in database using async queries."""
+        from app.config import settings as _settings
         self.foreign_keys = []
         self.fk_index = {}
         self.reverse_fk_index = {}
@@ -260,24 +261,24 @@ class SemanticValueGrounderEnhanced:
         try:
             # Query FK relationships from information_schema (fully async)
             fk_query = text("""
-                SELECT 
+                SELECT
                     kcu1.table_name AS from_table,
                     kcu1.column_name AS from_column,
                     kcu2.table_name AS to_table,
                     kcu2.column_name AS to_column,
                     rc.constraint_name
                 FROM information_schema.referential_constraints rc
-                JOIN information_schema.key_column_usage kcu1 
-                    ON rc.constraint_name = kcu1.constraint_name 
+                JOIN information_schema.key_column_usage kcu1
+                    ON rc.constraint_name = kcu1.constraint_name
                     AND rc.constraint_schema = kcu1.table_schema
-                JOIN information_schema.key_column_usage kcu2 
-                    ON rc.unique_constraint_name = kcu2.constraint_name 
+                JOIN information_schema.key_column_usage kcu2
+                    ON rc.unique_constraint_name = kcu2.constraint_name
                     AND rc.unique_constraint_schema = kcu2.table_schema
-                WHERE kcu1.table_schema = 'genai'
+                WHERE kcu1.table_schema = :schema_name
                 ORDER BY kcu1.table_name, kcu1.column_name
             """)
             
-            result = await db.execute(fk_query)
+            result = await db.execute(fk_query, {"schema_name": _settings.postgres_schema})
             rows = result.fetchall()
             
             for row in rows:
@@ -318,29 +319,31 @@ class SemanticValueGrounderEnhanced:
     ):
         """Profile actual values in database columns using async queries."""
         try:
+            from app.config import settings as _settings
+            _schema_name = _settings.postgres_schema
             # Get table list from information_schema if not provided
             if table_names is None:
                 tables_query = text("""
-                    SELECT table_name 
-                    FROM information_schema.tables 
-                    WHERE table_schema = 'genai' 
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = :schema_name
                     AND table_type = 'BASE TABLE'
                     ORDER BY table_name
                 """)
-                result = await db.execute(tables_query)
+                result = await db.execute(tables_query, {"schema_name": _schema_name})
                 table_names = [row[0] for row in result.fetchall()]
-            
+
             for table in table_names:
                 try:
                     # Get columns from information_schema
                     columns_query = text("""
                         SELECT column_name, data_type, udt_name
                         FROM information_schema.columns
-                        WHERE table_schema = 'genai' AND table_name = :table_name
+                        WHERE table_schema = :schema_name AND table_name = :table_name
                         ORDER BY ordinal_position
                     """)
                     
-                    result = await db.execute(columns_query, {"table_name": table})
+                    result = await db.execute(columns_query, {"schema_name": _schema_name, "table_name": table})
                     columns = result.fetchall()
                     self.column_profiles[table] = {}
                     

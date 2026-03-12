@@ -23,10 +23,11 @@ from typing import Dict, List, Optional, Literal, Any
 from abc import ABC, abstractmethod
 
 from .query_plan import (
-    QueryPlan, SelectClause, FromClause, JoinClause, JoinCondition, 
+    QueryPlan, SelectClause, FromClause, JoinClause, JoinCondition,
     GroupByClause, HavingClause, OrderByClause, OrderByField,
     BinaryCondition, LogicalCondition, NotCondition, Condition,
-    ColumnRef, Literal as LiteralValue, SubqueryValue
+    ColumnRef, Literal as LiteralValue, SubqueryValue,
+    WindowFunction, CTEClause, SetOperation,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,54 +64,71 @@ class PostgreSQLGenerator(SQLGenerator):
         """Generate a complete PostgreSQL SELECT statement."""
         if plan.intent != "data_query" or not plan.select or not plan.from_:
             raise ValueError("Cannot generate SQL from invalid QueryPlan")
-        
+
         parts = []
-        
-        # SELECT clause
+
+        # WITH / WITH RECURSIVE (CTEs)
+        if plan.ctes:
+            has_recursive = any(c.recursive for c in plan.ctes)
+            keyword = "WITH RECURSIVE" if has_recursive else "WITH"
+            cte_defs = ",\n".join(f"{c.name} AS (\n{c.raw_sql}\n)" for c in plan.ctes)
+            parts.append(f"{keyword}\n{cte_defs}")
+
+        # SELECT clause (includes window functions)
         parts.append(self._select_clause(plan.select))
-        
+
         # FROM clause
         parts.append(self._from_clause(plan.from_))
-        
+
         # JOINs
         if plan.joins:
             for join in plan.joins:
                 parts.append(self._join_clause(join, plan))
-        
+
         # WHERE
         if plan.where:
             where_sql = " AND ".join([self._condition_to_sql(cond) for cond in plan.where])
             parts.append(f"WHERE {where_sql}")
-        
+
         # GROUP BY
         if plan.group_by:
             group_fields = ", ".join(plan.group_by.fields)
             parts.append(f"GROUP BY {group_fields}")
-        
+
         # HAVING
         if plan.having:
             having_sql = " AND ".join([self._condition_to_sql(cond) for cond in plan.having.conditions])
             parts.append(f"HAVING {having_sql}")
-        
+
         # ORDER BY
         if plan.order_by:
             order_fields = ", ".join([
                 f"{f.expr} {f.direction.upper()}" for f in plan.order_by.fields
             ])
             parts.append(f"ORDER BY {order_fields}")
-        
+
         # LIMIT/OFFSET
         if plan.limit is not None:
             parts.append(self.limit_clause(plan.limit, plan.offset))
-        
+
         sql = "\n".join(parts)
+
+        # Set operation (UNION / INTERSECT / EXCEPT)
+        if plan.set_op:
+            op_keyword = plan.set_op.op.upper().replace("_", " ")
+            sql = f"{sql}\n{op_keyword}\n{plan.set_op.raw_sql}"
+
         logger.debug(f"Generated PostgreSQL: {sql}")
         return sql
     
     def _select_clause(self, select: SelectClause) -> str:
-        """Generate SELECT clause."""
+        """Generate SELECT clause (including window function expressions)."""
         distinct = "DISTINCT " if select.distinct else ""
-        fields = ", ".join(select.fields)
+        all_fields = list(select.fields)
+        if select.windows:
+            for wf in select.windows:
+                all_fields.append(wf.to_sql_fragment())
+        fields = ", ".join(all_fields)
         return f"SELECT {distinct}{fields}"
     
     def _from_clause(self, from_: FromClause) -> str:
@@ -189,6 +207,10 @@ class PostgreSQLGenerator(SQLGenerator):
         elif isinstance(value, SubqueryValue):
             subquery_sql = self.generate(value.query)
             return f"({subquery_sql})"
+        elif isinstance(value, (list, tuple)):
+            # Handle IN clause lists - convert each element 
+            formatted_values = [self._value_to_sql(v) for v in value]
+            return f"({', '.join(formatted_values)})"
         return str(value)
     
     def quote_identifier(self, identifier: str) -> str:
@@ -207,119 +229,183 @@ class PostgreSQLGenerator(SQLGenerator):
         return " ".join(parts)
 
 
-class MySQLGenerator(SQLGenerator):
-    """Generate MySQL-compatible SQL."""
-    
-    def generate(self, plan: QueryPlan) -> str:
-        """Generate MySQL SQL (similar to PostgreSQL but with dialect differences)."""
-        # Most of the logic is the same as PostgreSQL
-        # Key differences: backtick quoting, LIMIT offsets different syntax
-        pg_gen = PostgreSQLGenerator()
-        sql = pg_gen.generate(plan)
-        
-        # Convert PostgreSQL-specific syntax to MySQL
-        # This is a simplified version - production would be more thorough
-        sql = sql.replace("FULL OUTER JOIN", "FULL OUTER JOIN")  # Not supported, would need UNION
-        
-        logger.debug(f"Generated MySQL: {sql}")
-        return sql
-    
+class MySQLGenerator(PostgreSQLGenerator):
+    """Generate MySQL-compatible SQL.
+
+    Inherits the full generation logic from PostgreSQLGenerator and overrides
+    only the dialect-specific pieces so that overrides (quoting, boolean, limit,
+    join handling) are actually used during generation.
+    """
+
+    def _join_clause(self, join: JoinClause, plan: QueryPlan) -> str:
+        """MySQL does not support FULL OUTER JOIN; fall back to LEFT JOIN."""
+        if join.type == "full":
+            logger.warning(
+                "[MySQLGenerator] FULL OUTER JOIN is not supported by MySQL. "
+                "Falling back to LEFT JOIN — results may differ for non-matching rows."
+            )
+            # Emit a LEFT JOIN so the SQL is at least syntactically valid.
+            join_type = "LEFT JOIN"
+        else:
+            join_type = {
+                "inner": "INNER JOIN",
+                "left": "LEFT JOIN",
+                "right": "RIGHT JOIN",
+                "cross": "CROSS JOIN",
+            }.get(join.type, "INNER JOIN")
+
+        parts = [f"{join_type} {join.table}"]
+        if join.alias:
+            parts.append(join.alias)
+        if join.on:
+            on_conditions = " AND ".join(
+                self._join_condition_to_sql(cond) for cond in join.on
+            )
+            parts.append(f"ON {on_conditions}")
+        return " ".join(parts)
+
     def quote_identifier(self, identifier: str) -> str:
         """MySQL uses backticks for identifiers."""
         return f"`{identifier}`"
-    
+
     def boolean_literal(self, value: bool) -> str:
-        """MySQL uses TRUE/FALSE or 0/1."""
+        """MySQL uses TRUE/FALSE literals."""
         return "TRUE" if value else "FALSE"
-    
+
     def limit_clause(self, limit: int, offset: Optional[int] = None) -> str:
-        """MySQL LIMIT syntax: LIMIT [offset,] count."""
+        """MySQL LIMIT syntax: LIMIT count  or  LIMIT offset, count."""
         if offset:
             return f"LIMIT {offset}, {limit}"
         return f"LIMIT {limit}"
 
 
-class SQLiteGenerator(SQLGenerator):
-    """Generate SQLite-compatible SQL."""
-    
-    def generate(self, plan: QueryPlan) -> str:
-        """Generate SQLite SQL (most restricted)."""
-        pg_gen = PostgreSQLGenerator()
-        sql = pg_gen.generate(plan)
-        
-        # SQLite differences:
-        # - No FULL OUTER JOIN
-        # - No OFFSET without LIMIT (must use LIMIT -1 OFFSET N)
-        sql = sql.replace("FULL OUTER JOIN", "LEFT OUTER JOIN")
-        
-        logger.debug(f"Generated SQLite: {sql}")
-        return sql
-    
+class SQLiteGenerator(PostgreSQLGenerator):
+    """Generate SQLite-compatible SQL.
+
+    Inherits generation logic from PostgreSQLGenerator and overrides
+    dialect-specific behaviour so overrides are actually applied during
+    generation (not via post-hoc string replacement).
+    """
+
+    def _join_clause(self, join: JoinClause, plan: QueryPlan) -> str:
+        """SQLite does not support FULL OUTER JOIN; use LEFT JOIN instead."""
+        if join.type == "full":
+            logger.warning(
+                "[SQLiteGenerator] FULL OUTER JOIN is not supported by SQLite. "
+                "Falling back to LEFT JOIN."
+            )
+            effective_join = JoinClause(
+                table=join.table,
+                alias=join.alias,
+                type="left",
+                on=join.on,
+            )
+            return super()._join_clause(effective_join, plan)
+        return super()._join_clause(join, plan)
+
     def quote_identifier(self, identifier: str) -> str:
-        """SQLite uses double quotes."""
+        """SQLite uses double quotes (same as PostgreSQL)."""
         return f'"{identifier}"'
-    
+
     def boolean_literal(self, value: bool) -> str:
-        """SQLite uses 0/1 for booleans."""
+        """SQLite represents booleans as integers."""
         return "1" if value else "0"
-    
+
     def limit_clause(self, limit: int, offset: Optional[int] = None) -> str:
-        """SQLite LIMIT syntax."""
+        """SQLite LIMIT/OFFSET syntax."""
         if offset:
-            # SQLite requires a limit, use -1 for unlimited
             return f"LIMIT {limit} OFFSET {offset}"
         return f"LIMIT {limit}"
 
 
-class SQLServerGenerator(SQLGenerator):
-    """Generate SQL Server-compatible SQL."""
-    
+class SQLServerGenerator(PostgreSQLGenerator):
+    """Generate SQL Server (T-SQL) compatible SQL.
+
+    SQL Server uses TOP N in the SELECT clause rather than a trailing LIMIT
+    clause, and uses OFFSET…FETCH for pagination.  We override `generate()`
+    to build the parts list ourselves so that TOP is inserted in the right
+    place and the LIMIT line is never emitted.
+    """
+
     def generate(self, plan: QueryPlan) -> str:
-        """Generate SQL Server SQL."""
-        pg_gen = PostgreSQLGenerator()
-        sql = pg_gen.generate(plan)
-        
-        # SQL Server differences:
-        # - Uses TOP instead of LIMIT
-        # - Different JOIN syntax for some types
-        # - OFFSET...FETCH syntax
-        
-        # Convert LIMIT to TOP and OFFSET to FETCH
-        if "LIMIT" in sql:
-            lines = sql.split("\n")
-            new_lines = []
-            for line in lines:
-                if "LIMIT" in line:
-                    # Parse LIMIT and OFFSET
-                    parts = line.split()
-                    limit_idx = parts.index("LIMIT")
-                    limit_val = parts[limit_idx + 1]
-                    
-                    # Move SELECT and add TOP
-                    for i, l in enumerate(new_lines):
-                        if l.startswith("SELECT"):
-                            new_lines[i] = l.replace("SELECT", f"SELECT TOP {limit_val}")
-                    # Don't include the LIMIT line
-                else:
-                    new_lines.append(line)
-            sql = "\n".join(new_lines)
-        
+        """Generate a complete T-SQL SELECT statement."""
+        if plan.intent != "data_query" or not plan.select or not plan.from_:
+            raise ValueError("Cannot generate SQL from invalid QueryPlan")
+
+        parts = []
+
+        # SELECT [TOP N] ...
+        select_sql = self._select_clause(plan.select)
+        if plan.limit is not None and plan.offset is None:
+            # Simple TOP N (no pagination) — insert TOP directly after SELECT
+            select_sql = select_sql.replace("SELECT ", f"SELECT TOP {plan.limit} ", 1)
+        parts.append(select_sql)
+
+        # FROM
+        parts.append(self._from_clause(plan.from_))
+
+        # JOINs
+        if plan.joins:
+            for join in plan.joins:
+                parts.append(self._join_clause(join, plan))
+
+        # WHERE
+        if plan.where:
+            where_sql = " AND ".join(self._condition_to_sql(c) for c in plan.where)
+            parts.append(f"WHERE {where_sql}")
+
+        # GROUP BY
+        if plan.group_by:
+            parts.append(f"GROUP BY {', '.join(plan.group_by.fields)}")
+
+        # HAVING
+        if plan.having:
+            having_sql = " AND ".join(self._condition_to_sql(c) for c in plan.having.conditions)
+            parts.append(f"HAVING {having_sql}")
+
+        # ORDER BY (required when OFFSET…FETCH is used)
+        if plan.order_by:
+            order_fields = ", ".join(
+                f"{f.expr} {f.direction.upper()}" for f in plan.order_by.fields
+            )
+            parts.append(f"ORDER BY {order_fields}")
+        elif plan.offset is not None:
+            # OFFSET…FETCH requires ORDER BY; add a minimal one
+            parts.append("ORDER BY (SELECT NULL)")
+
+        # Pagination — use OFFSET…FETCH when offset is requested
+        if plan.limit is not None and plan.offset is not None:
+            parts.append(self.limit_clause(plan.limit, plan.offset))
+
+        sql = "\n".join(parts)
+
+        # CTEs — prepend WITH clause (T-SQL supports WITH / WITH ... AS)
+        if plan.ctes:
+            has_recursive = any(c.recursive for c in plan.ctes)
+            keyword = "WITH" if not has_recursive else "WITH"  # T-SQL has no WITH RECURSIVE
+            cte_defs = ",\n".join(f"{c.name} AS (\n{c.raw_sql}\n)" for c in plan.ctes)
+            sql = f"{keyword}\n{cte_defs}\n{sql}"
+
+        # Set operation
+        if plan.set_op:
+            op_keyword = plan.set_op.op.upper().replace("_", " ")
+            sql = f"{sql}\n{op_keyword}\n{plan.set_op.raw_sql}"
+
         logger.debug(f"Generated SQL Server: {sql}")
         return sql
-    
+
     def quote_identifier(self, identifier: str) -> str:
-        """SQL Server uses square brackets."""
+        """SQL Server uses square brackets for identifiers."""
         return f"[{identifier}]"
-    
+
     def boolean_literal(self, value: bool) -> str:
-        """SQL Server uses 1/0."""
+        """SQL Server uses 1/0 for boolean-like values."""
         return "1" if value else "0"
-    
+
     def limit_clause(self, limit: int, offset: Optional[int] = None) -> str:
-        """SQL Server uses OFFSET...FETCH."""
-        if offset:
-            return f"OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY"
-        return f"OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY"
+        """SQL Server pagination uses OFFSET…FETCH."""
+        off = offset or 0
+        return f"OFFSET {off} ROWS FETCH NEXT {limit} ROWS ONLY"
 
 
 class DialectCompiler:
@@ -366,3 +452,38 @@ class DialectCompiler:
         except Exception as e:
             logger.error(f"✗ Compilation failed for {self.dialect}: {e}")
             raise
+
+
+# ============================================================================
+# Convenience Functions
+# ============================================================================
+
+def get_dialect_compiler(dialect: str = "postgresql") -> SQLGenerator:
+    """
+    Get a dialect-specific SQL generator.
+    
+    Args:
+        dialect: SQL dialect name
+    
+    Returns:
+        SQLGenerator instance for the dialect
+    """
+    compiler = DialectCompiler(dialect)
+    return compiler.generator
+
+
+def compile_query_plan(plan: QueryPlan, dialect: str = "postgresql") -> str:
+    """
+    Compile a QueryPlan to SQL for specification dialect.
+    
+    This is the main entry point for SQL generation from QueryPlan.
+    
+    Args:
+        plan: QueryPlan to compile
+        dialect: Target SQL dialect
+    
+    Returns:
+        SQL string
+    """
+    compiler = DialectCompiler(dialect)
+    return compiler.compile(plan)

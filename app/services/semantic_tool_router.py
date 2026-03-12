@@ -89,7 +89,7 @@ class SemanticToolRouter:
         """Set schema context with available table names for better routing decisions."""
         if table_names:
             self._table_names = table_names
-            logger.info(f"[SEMANTIC ROUTER] Schema context set with {len(table_names)} tables: {', '.join(table_names[:10])}...")
+            logger.info(f"[SEMANTIC ROUTER] Schema context set with {len(table_names)} tables: {', '.join(table_names)}")
     
     async def _get_embedding_service(self):
         """Lazy-load embedding service."""
@@ -422,7 +422,7 @@ Respond with ONLY valid JSON:
                 # High confidence semantic match → route to SQL
                 logger.info(
                     f"[SEMANTIC ROUTER] 🎯 HIGH CONFIDENCE SEMANTIC MATCH (fallback): "
-                    f"'{user_query[:40]}...' → table '{best_table}' (similarity: {best_score:.2f})"
+                    f"'{user_query}' → table '{best_table}' (similarity: {best_score:.2f})"
                 )
                 return SemanticRoutingResult(
                     tool=ToolType.RUN_SQL,

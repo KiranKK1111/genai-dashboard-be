@@ -146,6 +146,56 @@ class Settings(BaseSettings):
     enable_semantic_concept_mapper: bool = Field(False, env="ENABLE_SEMANTIC_CONCEPT_MAPPER")
     semantic_concept_confidence_threshold: float = Field(0.7, env="SEMANTIC_CONCEPT_CONFIDENCE_THRESHOLD")
 
+    # ── DB Connection Pool ────────────────────────────────────────────────────
+    db_pool_size: int = Field(10, env="DB_POOL_SIZE")
+    db_max_overflow: int = Field(20, env="DB_MAX_OVERFLOW")
+    db_pool_timeout: int = Field(30, env="DB_POOL_TIMEOUT")       # seconds
+    db_pool_recycle: int = Field(1800, env="DB_POOL_RECYCLE")     # seconds (30 min)
+    db_pool_pre_ping: bool = Field(True, env="DB_POOL_PRE_PING")
+
+    # ── Rate Limiting ─────────────────────────────────────────────────────────
+    rate_limit_per_minute: int = Field(30, env="RATE_LIMIT_PER_MINUTE")
+    rate_limit_enabled: bool = Field(True, env="RATE_LIMIT_ENABLED")
+
+    # ── Vector Search ─────────────────────────────────────────────────────────
+    vector_similarity_threshold: float = Field(0.5, env="VECTOR_SIMILARITY_THRESHOLD")
+    vector_search_top_k: int = Field(5, env="VECTOR_SEARCH_TOP_K")
+    vector_search_timeout_ms: int = Field(5000, env="VECTOR_SEARCH_TIMEOUT_MS")
+
+    # ── Conversation Memory ───────────────────────────────────────────────────
+    memory_max_context_tokens: int = Field(6000, env="MEMORY_MAX_CONTEXT_TOKENS")
+    memory_keep_recent_messages: int = Field(5, env="MEMORY_KEEP_RECENT_MESSAGES")
+    memory_keep_messages_hours: int = Field(24, env="MEMORY_KEEP_MESSAGES_HOURS")
+
+    # ── Schema Intelligence ───────────────────────────────────────────────────
+    schema_high_confidence_threshold: float = Field(0.85, env="SCHEMA_HIGH_CONFIDENCE_THRESHOLD")
+    schema_clarification_threshold: float = Field(0.60, env="SCHEMA_CLARIFICATION_THRESHOLD")
+    schema_max_join_depth: int = Field(2, env="SCHEMA_MAX_JOIN_DEPTH")
+    schema_change_poll_interval_sec: int = Field(60, env="SCHEMA_CHANGE_POLL_INTERVAL_SEC")
+
+    # ── SQL Execution ─────────────────────────────────────────────────────────
+    sql_statement_timeout_sec: int = Field(30, env="SQL_STATEMENT_TIMEOUT_SEC")
+    sql_max_result_rows: int = Field(100_000, env="SQL_MAX_RESULT_ROWS")
+
+    # ── Session Archival ──────────────────────────────────────────────────────
+    session_max_live_turns: int = Field(50, env="SESSION_MAX_LIVE_TURNS")
+    session_archive_keep_turns: int = Field(20, env="SESSION_ARCHIVE_KEEP_TURNS")
+
+    # ── Caching ───────────────────────────────────────────────────────────────
+    query_cache_ttl_sec: int = Field(300, env="QUERY_CACHE_TTL_SEC")
+    query_cache_max_items: int = Field(1000, env="QUERY_CACHE_MAX_ITEMS")
+
+    # ── Semantic Pipeline ─────────────────────────────────────────────────────
+    semantic_confidence_threshold: float = Field(0.60, env="SEMANTIC_CONFIDENCE_THRESHOLD")
+    semantic_catalog_ttl_minutes: int = Field(60, env="SEMANTIC_CATALOG_TTL_MINUTES")
+    smart_query_ambiguity_threshold: float = Field(0.50, env="SMART_QUERY_AMBIGUITY_THRESHOLD")
+
+    # ── Background Tasks (arq) ────────────────────────────────────────────────
+    redis_url: str = Field("redis://localhost:6379", env="REDIS_URL")
+    arq_enabled: bool = Field(False, env="ARQ_ENABLED")          # opt-in; falls back to inline
+    arq_max_jobs: int = Field(10, env="ARQ_MAX_JOBS")
+    heavy_query_join_threshold: int = Field(2, env="HEAVY_QUERY_JOIN_THRESHOLD")  # joins >= this → background
+
     @validator("cors_origins", pre=True)
     def parse_cors_origins(cls, v):  # type: ignore[override]
         # Accept JSON list string, comma‑separated values, or None

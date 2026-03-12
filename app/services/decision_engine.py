@@ -348,13 +348,16 @@ class DecisionEngine:
                 # Fallback: Query table names directly from database
                 from sqlalchemy import text
                 from ..config import settings
-                schema_name = settings.postgres_schema or "genai"
-                result = await db.execute(text(f"""
-                    SELECT table_name 
-                    FROM information_schema.tables 
-                    WHERE table_schema = '{schema_name}' 
-                    AND table_type = 'BASE TABLE'
-                """))
+                schema_name = settings.postgres_schema
+                result = await db.execute(
+                    text("""
+                        SELECT table_name
+                        FROM information_schema.tables
+                        WHERE table_schema = :schema_name
+                        AND table_type = 'BASE TABLE'
+                    """),
+                    {"schema_name": schema_name},
+                )
                 table_names = [row[0] for row in result.fetchall()]
                 if table_names:
                     router.set_schema_context(table_names)
@@ -1075,7 +1078,7 @@ class DecisionEngine:
         """
         logger.warning(
             f"[DECISION] Using fallback CHAT mode after retry exhaustion. "
-            f"Message: {user_message[:100]}..."
+            f"Message: {user_message}"
         )
         return DecisionOutput(
             action=Action.CHAT,

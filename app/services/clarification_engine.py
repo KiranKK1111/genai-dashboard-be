@@ -31,6 +31,7 @@ Example:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -212,8 +213,21 @@ class ClarificationEngine:
         Returns:
             AmbiguityAnalysis with detected issues and clarification requests
         """
-        logger.info(f"[CLARIFICATION ENGINE] Analyzing query: {user_query[:100]}...")
-        
+        logger.info(f"[CLARIFICATION ENGINE] Analyzing query: {user_query}")
+
+        # ── Fast pre-check: skip LLM for clearly well-formed queries ──────────
+        # A query is clear when it has a recognisable SQL intent AND at least one
+        # specific token (entity, value, filter term).  These never need LLM
+        # clarification — routing + SQL generation handle them directly.
+        if self._is_clear_query(user_query):
+            logger.info("[CLARIFICATION ENGINE] Fast-path: query is clear, skipping LLM")
+            return AmbiguityAnalysis(
+                has_ambiguity=False,
+                confidence=0.9,
+                can_proceed=True,
+                reasoning="Fast-path: query structure is unambiguous",
+            )
+
         # Get schema if not provided
         if schema_context is None:
             schema_context = await self._get_schema_context()
@@ -269,8 +283,8 @@ Respond in JSON format:
             "question": "Which metric would you like to see?",
             "strategy": "multiple_choice|checkboxes|free_text|suggestion|yes_no",
             "options": [
-                {"id": "opt1", "label": "Total Metric (sum)", "description": "Sum of all metric values", "is_recommended": true},
-                {"id": "opt2", "label": "Metric Count", "description": "Number of metric records"}
+                {{"id": "opt1", "label": "Total Metric (sum)", "description": "Sum of all metric values", "is_recommended": true}},
+                {{"id": "opt2", "label": "Metric Count", "description": "Number of metric records"}}
             ],
             "context": "I found 3 metric-related columns in the database",
             "priority": 1,
@@ -287,8 +301,17 @@ Respond ONLY with valid JSON."""
 
         try:
             response = await llm.call_llm(prompt, temperature=0.1, json_mode=True)
-            import json
-            analysis_data = json.loads(response)
+            import json, re as _re
+            # Robust JSON parse: strip markdown fences, then extract first {...} block
+            _clean = _re.sub(r"```(?:json)?\s*", "", str(response)).strip().rstrip("`").strip()
+            try:
+                analysis_data = json.loads(_clean)
+            except json.JSONDecodeError:
+                _match = _re.search(r"\{.*\}", _clean, _re.DOTALL)
+                if _match:
+                    analysis_data = json.loads(_match.group(0))
+                else:
+                    raise
             
             # Parse clarification requests
             clarifications = []
@@ -395,6 +418,42 @@ Respond ONLY with valid JSON."""
         
         return resolved
     
+    # ── Clear-query detection (no LLM needed) ────────────────────────────────
+
+    _CLEAR_INTENT_PATTERNS = re.compile(
+        r'\b(how many|count|total|list|show|display|get|find|fetch|select|'
+        r'what is|what are|give me|tell me|average|avg|sum|max|min|top|'
+        r'number of)\b',
+        re.IGNORECASE,
+    )
+
+    def _is_clear_query(self, query: str) -> bool:
+        """
+        Return True if the query has a recognisable SQL intent AND at least
+        one specific token so no LLM clarification call is needed.
+
+        Criteria (all must hold):
+          1. Query has >= 3 words (single-word queries are genuinely ambiguous)
+          2. Query contains a clear data-retrieval verb/phrase
+          3. Query is not purely a greeting or meta-question
+        """
+        words = query.strip().split()
+        if len(words) < 3:
+            return False
+
+        if not self._CLEAR_INTENT_PATTERNS.search(query):
+            return False
+
+        # Reject greetings / meta questions
+        vague = re.compile(
+            r'^\s*(hi|hello|hey|help|what can you do|who are you)\s*[?!.]?\s*$',
+            re.IGNORECASE,
+        )
+        if vague.match(query):
+            return False
+
+        return True
+
     async def _get_schema_context(self) -> Dict[str, Any]:
         """Get database schema information."""
         from .semantic_schema_catalog import get_catalog

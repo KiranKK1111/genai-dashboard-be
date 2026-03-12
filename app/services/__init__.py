@@ -13,12 +13,65 @@ from .query_handler import (
 )
 from .query_orchestrator import handle_dynamic_query
 from .session_query_handler import execute_with_session_state
+
+# === PRODUCTION-GRADE ARCHITECTURE COMPONENTS ===
+# ChatGPT-level intelligence for execution, follow-ups, and schema understanding
+
+# Execution Policy Engine - Fast path routing (25s → 3s for simple queries)
+from .execution_policy_engine import (
+    ExecutionPolicyEngine,
+    get_execution_policy_engine,
+    ExecutionPath,
+    ExecutionPolicy,
+    QueryCharacteristics,
+)
+
+# Question-Back Engine - Proactive suggestions after results
+from .question_back_engine import (
+    QuestionBackEngine,
+    get_question_back_engine,
+    QuestionBackResult,
+    SuggestedAction,
+    QuestionType,
+)
+
+# Semantic State Graph - Structured conversation tracking
+from .semantic_state_graph import (
+    SemanticStateGraph,
+    get_state_graph,
+    clear_state_graph,
+    SemanticQueryState,
+    FilterCondition,
+    Aggregation,
+    FollowUpOperation,
+)
+
+# Schema Intelligence Service - Smart table/column resolution
+from .schema_intelligence_service import (
+    SchemaIntelligenceService,
+    get_schema_intelligence,
+    TableProfile,
+    ColumnProfile,
+    TableResolutionResult,
+    TableRole,
+)
+
+# ===================================================
+
+# Decision Arbiter - Single authority for routing decisions
+from .decision_arbiter import (
+    DecisionArbiter,
+    get_decision_arbiter,
+    ArbiterDecision,
+    TurnClass,
+    FollowUpSubtype,
+)
+
 from .response_generator import (
     ConversationState,
     DynamicResponseGenerator,
     create_conversation_state,
 )
-from .sql_generator import generate_sql, generate_sql_with_analysis
 from .response_formatter import should_return_as_message, determine_visualization_type
 from .database_analyzer import DatabaseAnalyzer, create_database_analyzer
 from .followup_context_manager import FollowupContextManager, FollowupContext, ContextSnapshot
@@ -36,6 +89,7 @@ from .decision_engine import DecisionEngine, Action, DecisionOutput, create_deci
 from .entity_parser import EntityParser, ParsedQuery, QueryIntent, create_entity_parser
 from .sql_safety_validator import SQLSafetyValidator, SQLParameterValidator, validate_sql_safety, create_sql_safety_validator
 from .followup_manager import FollowUpAnalyzer, FollowUpContext, FollowUpType, PreviousQueryContext, get_followup_analyzer
+from .query_context_extractor import QueryContextExtractor, get_query_context_extractor
 from .adaptive_schema_analyzer import AdaptiveSchemaAnalyzer, ColumnPurpose
 from .response_composer import ResponseComposer, ContentBlock, AssistantMessage, FollowUp, ArtifactsMetadata
 
@@ -48,19 +102,25 @@ from .query_plan import (
     TableNotFoundError, JoinPathNotFoundError, TypeMismatchError, InvalidSubqueryError
 )
 from .query_plan_validator import QueryPlanValidator, JoinPathFinder
-from .query_plan_compiler import DialectCompiler, SQLGenerator, PostgreSQLGenerator, MySQLGenerator, SQLiteGenerator, SQLServerGenerator
+from .query_plan_compiler import DialectCompiler, SQLGenerator, PostgreSQLGenerator, MySQLGenerator, SQLiteGenerator, SQLServerGenerator, compile_query_plan, get_dialect_compiler
+
+# QueryPlan Unifier - Single canonical SQL pipeline (NEW - Fixes multiple-pipeline problem)
+from .query_plan_unifier import (
+    CanonicalQueryPlan, convert_from_generator_plan, convert_from_plan_first,
+    convert_to_canonical, generate_sql_from_canonical_plan, warn_direct_sql_generation
+)
 
 # New validation and grounding services
 from .plan_validator import PlanValidator, validate_and_fix_plan
 from .value_grounding import ValueGrounder, FilterValueMapper
 
-# Plan-First Query Understanding Pipeline (NEW - ChatGPT-style semantic processing)
+# Plan-First Query Understanding Pipeline (uses canonical QueryPlan from query_plan.py)
 from .semantic_concept_extractor import (
     SemanticConceptExtractor, SemanticIntent, FilterConcept, IntentType, OperatorType,
     get_concept_extractor
 )
 from .plan_first_sql_generator import (
-    PlanFirstQueryHandler, SemanticGrounder, QueryPlan, ColumnMapping,
+    PlanFirstQueryHandler, SemanticGrounder, ColumnMapping,
     get_plan_first_handler
 )
 from .query_coverage_verifier import (
@@ -190,7 +250,10 @@ from .cancellation_manager import (
 )
 from .progress_tracker import (
     ProgressTracker, ProgressTrackerManager, ProgressStep, ProgressUpdate,
-    progress_tracker_manager
+    progress_tracker_manager,
+    PLAN_SQL, PLAN_FILE_STRUCTURED, PLAN_FILE_UNSTRUCTURED,
+    PLAN_FILE_LOOKUP_STRUCTURED, PLAN_FILE_LOOKUP_UNSTRUCTURED,
+    PLAN_CHAT, PLAN_VARIATIONS,
 )
 
 # NEW: Efficient Semantic Routing System
@@ -198,6 +261,17 @@ from .semantic_routing_integration import SemanticRoutingIntegration, create_rou
 from .semantic_intent_router import SemanticIntentRouter, create_router
 from .efficient_query_router import EfficientQueryRouter, create_efficient_router
 from .turn_state_manager import TurnStateManager, create_turn_state_manager
+
+# NEW: Structured File Query Engine (NL → pandas, CSV/XLSX/XLS)
+from .structured_file_engine import (
+    StructuredFileEngine,
+    StructuredFileResult,
+    get_structured_file_engine,
+)
+
+# Artifact-centric response architecture (ResponseGeneration.md)
+from .result_shape_analyzer import ResultShapeAnalyzer, ResultShape
+from .artifact_planner import ArtifactPlanner
 
 __all__ = [
     # Core existing services
@@ -223,8 +297,6 @@ __all__ = [
     "EmbeddingService",
     "FollowupContext",
     "FollowupContextManager",
-    "generate_sql",
-    "generate_sql_with_analysis",
     "handle_dynamic_query",
     "process_file_upload",
     "retrieve_relevant_chunks",
@@ -300,6 +372,16 @@ __all__ = [
     "MySQLGenerator",
     "SQLiteGenerator",
     "SQLServerGenerator",
+    "compile_query_plan",
+    "get_dialect_compiler",
+    
+    # QueryPlan Unifier - Single canonical SQL pipeline (NEW)
+    "CanonicalQueryPlan",
+    "convert_from_generator_plan",
+    "convert_from_plan_first",
+    "convert_to_canonical",
+    "generate_sql_from_canonical_plan",
+    "warn_direct_sql_generation",
     
     # DB-Agnostic infrastructure (NEW)
     "DialectAdapter",
@@ -436,4 +518,14 @@ __all__ = [
     "SemanticFollowUpRewriter",
     "SemanticFollowUpContext",
     "get_followup_rewriter",
+
+    # NEW: Structured File Query Engine (NL → pandas)
+    "StructuredFileEngine",
+    "StructuredFileResult",
+    "get_structured_file_engine",
+
+    # Artifact-centric response architecture (ResponseGeneration.md)
+    "ResultShapeAnalyzer",
+    "ResultShape",
+    "ArtifactPlanner",
 ]

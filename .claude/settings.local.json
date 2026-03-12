@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/SDM GENAI/genai_frontend/src/contexts/**)",
+      "Read(//d/SDM GENAI/genai_frontend/**)"
+    ]
+  }
+}

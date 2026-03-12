@@ -91,7 +91,7 @@ def make_json_serializable(obj: Any) -> Any:
     """Convert non-JSON-serializable objects to JSON-safe format.
     
     Handles common non-serializable types like objects with __dict__,
-    numpy types, datetime, etc.
+    numpy types, datetime, Decimal, etc.
     
     Args:
         obj: Any Python object
@@ -99,6 +99,9 @@ def make_json_serializable(obj: Any) -> Any:
     Returns:
         JSON-serializable version of the object
     """
+    from decimal import Decimal
+    from datetime import date, time
+    
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
     
@@ -108,6 +111,10 @@ def make_json_serializable(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [make_json_serializable(item) for item in obj]
     
+    # Handle Decimal (convert to float for JSON)
+    if isinstance(obj, Decimal):
+        return float(obj)
+    
     # Handle numpy types
     if isinstance(obj, (np.integer, np.floating)):
         return obj.item()
@@ -115,8 +122,8 @@ def make_json_serializable(obj: Any) -> Any:
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     
-    # Handle datetime objects
-    if isinstance(obj, datetime):
+    # Handle datetime objects (datetime, date, time)
+    if isinstance(obj, (datetime, date, time)):
         return obj.isoformat()
     
     # For custom objects, try to convert to dict

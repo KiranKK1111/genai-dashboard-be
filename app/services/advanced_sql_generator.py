@@ -158,7 +158,7 @@ class AdvancedSQLGenerator:
         # Validate and enhance
         sql = sql.strip()
         
-        logger.info(f"[SQL_GEN] ✅ Generated SQL: {sql[:80]}...")
+        logger.info(f"[SQL_GEN] ✅ Generated SQL: {sql}")
         
         return sql, {
             "patterns": [p.value for p in patterns],

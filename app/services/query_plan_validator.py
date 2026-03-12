@@ -38,7 +38,7 @@ class QueryPlanValidator:
     Validates a QueryPlan against a SchemaCatalog.
     
     Usage:
-        catalog = SchemaCatalog("genai")
+        catalog = SchemaCatalog(settings.postgres_schema)
         await catalog.initialize(db)
         
         validator = QueryPlanValidator(catalog)

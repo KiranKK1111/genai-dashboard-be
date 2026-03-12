@@ -89,7 +89,7 @@ class RAGContextRetriever:
         Returns:
             RAGContext with most relevant previous query, or None if nothing found
         """
-        print(f"\n[RAG] Semantic retrieval for: {current_query[:50]}...")
+        print(f"\n[RAG] Semantic retrieval for: {current_query}")
         
         # Step 1: Generate semantic embedding for current query
         # Uses token hashing - database-agnostic, works with any schema
@@ -97,12 +97,13 @@ class RAGContextRetriever:
         current_embedding = await generator.generate_embedding(current_query)
         
         # Step 2: Search for semantically similar queries in session history
-        store = await get_embedding_store(db_session=self.db_session)
+        store = await get_embedding_store()
         similar_queries = await store.search_similar_queries(
             session_id=session_id,
             query_embedding=current_embedding,
             top_k=self.top_k,
             similarity_threshold=self.similarity_threshold,
+            db_session=self.db_session,  # Pass explicitly — never stored on singleton
         )
         
         # Step 3: If semantic search finds results, return best match
@@ -110,8 +111,8 @@ class RAGContextRetriever:
             best_match, score = similar_queries[0]
             
             print(f"[RAG] Semantic match found (score: {score:.2f})")
-            print(f"[RAG]   Previous: {best_match.user_query[:60]}...")
-            print(f"[RAG]   SQL: {best_match.generated_sql[:60]}...")
+            print(f"[RAG]   Previous: {best_match.user_query}")
+            print(f"[RAG]   SQL: {best_match.generated_sql}")
             print(f"[RAG]   Results: {best_match.result_count} rows")
             
             context_text = self._format_context(best_match, score)
@@ -131,8 +132,14 @@ class RAGContextRetriever:
         # This handles implicit follow-ups like "only those approved" after a previous data query
         # The semantic embeddings of both queries may be low-similarity, but recent context is still valuable
         print(f"[RAG] No semantic match at threshold {self.similarity_threshold}, falling back to recency...")
-        
+
         session_history = store.get_session_history(session_id)
+        # After re-login/server restart, in-memory store is empty — check database
+        if not session_history and self.db_session:
+            print(f"[RAG] No in-memory history, checking database...")
+            session_history = await store.get_session_history_from_db(
+                session_id, db_session=self.db_session
+            )
         if not session_history:
             print(f"[RAG] No previous queries in session")
             return None
@@ -141,8 +148,8 @@ class RAGContextRetriever:
         best_match = session_history[-1]
         
         print(f"[RAG] Using most recent query (recency fallback):")
-        print(f"[RAG]   Previous: {best_match.user_query[:60]}...")
-        print(f"[RAG]   SQL: {best_match.generated_sql[:60]}...")
+        print(f"[RAG]   Previous: {best_match.user_query}")
+        print(f"[RAG]   SQL: {best_match.generated_sql}")
         
         # Estimate similarity based on recency
         recency_score = 0.6  # Conservative score for recency-based fallback

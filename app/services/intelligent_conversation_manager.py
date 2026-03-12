@@ -207,7 +207,7 @@ class IntelligentConversationManager:
         # Memory management
         self._manage_memory_limits(memory)
         
-        logger.info(f"📝 Added turn {len(memory.turns)} to session {session_id[:8]}... (importance: {turn.importance_level.value})")
+        logger.info(f"📝 Added turn {len(memory.turns)} to session {session_id} (importance: {turn.importance_level.value})")
         
         return turn
     
@@ -313,7 +313,7 @@ class IntelligentConversationManager:
             # Most recent successful query
             for turn_data in relevant_turns:
                 if turn_data.get("results_count", 0) > 0:
-                    summary_parts.append(f"Previous query: {turn_data['user_query'][:80]}...")
+                    summary_parts.append(f"Previous query: {turn_data['user_query']}")
                     break
             
             # Key entities being discussed
@@ -508,7 +508,7 @@ class IntelligentConversationManager:
             # Update turns list
             memory.turns = important_turns + recent_turns
             
-            logger.info(f"🗜️ Compressed {len(middle_turns)} turns for session {memory.session_id[:8]}...")
+            logger.info(f"🗜️ Compressed {len(middle_turns)} turns for session {memory.session_id}")
     
     def _compress_turns_to_summary(self, turns: List[ConversationTurn]) -> str:
         """Compress multiple turns into a summary"""

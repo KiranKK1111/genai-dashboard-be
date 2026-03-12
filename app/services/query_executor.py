@@ -74,7 +74,7 @@ async def get_record_count(session: AsyncSession, sql: str) -> int:
                 # Fallback (shouldn't happen)
                 count_sql = f"SELECT COUNT(*) as cnt FROM ({sql_no_limit}) as subq"
         
-        print(f"[COUNT PROBE] Executing: {count_sql[:100]}...")
+        print(f"[COUNT PROBE] Executing: {count_sql}")
         
         result = await session.execute(text(count_sql))
         row = result.mappings().first()
@@ -120,7 +120,7 @@ async def run_sql(session: AsyncSession, sql: str) -> List[Dict[str, Any]]:
         if "greenlet_spawn" in error_str or "await_only" in error_str:
             print(f"[ERROR] Async context error detected: {error_str}")
             print(f"[ERROR] This typically means we're mixing sync and async operations")
-            print(f"[ERROR] SQL: {sql[:100]}...")
+            print(f"[ERROR] SQL: {sql}")
             # Try to rollback anyway
             try:
                 await session.rollback()

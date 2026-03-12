@@ -237,7 +237,7 @@ class AdvancedNLPProcessor:
         # 🚨 CHECK FOR GIBBERISH FIRST - if detected, return special result
         is_gibberish, gibberish_reason = self._detect_gibberish(query)
         if is_gibberish:
-            print(f"[NLP] 🚨 GIBBERISH DETECTED: {gibberish_reason} for query: '{query[:50]}...'")
+            print(f"[NLP] 🚨 GIBBERISH DETECTED: {gibberish_reason} for query: '{query}'")
             return NLPAnalysisResult(
                 original_query=query,
                 primary_intent=QueryIntentType.UNKNOWN,

@@ -1,12 +1,12 @@
-"""
+﻿"""
 Semantic Query Orchestrator - Coordinates the 5-component semantic query pipeline.
 
 Pipeline Flow:
 1. Load/refresh semantic catalog (schema metadata + profiles)
-2. Embed user query → retrieve Top-K tables/columns as context
-3. LLM generates QueryPlan (JSON, not raw SQL)
+2. Embed user query â†’ retrieve Top-K tables/columns as context
+3. LLM generates canonical QueryPlan (JSON, not raw SQL)
 4. Confidence gate: If confidence < 60%, ask clarification
-5. Plan → SQL rendering (dialect-aware per database)
+5. Plan â†’ SQL rendering (dialect-aware per database)
 6. Safety validation + execution
 
 This orchestrator bridges all semantic components into the active query flow.
@@ -24,7 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .semantic_schema_catalog import SemanticSchemaCatalog, TableMetadata, ColumnMetadata
 from .embedding_retriever import EmbeddingBasedRetriever
-from .query_plan_generator import QueryPlanGenerator, QueryPlan, QueryPlanRenderer, ColumnSelectionAnalysis, ColumnSelectionIntent
+from .query_plan_generator import QueryPlanGenerator  # Generator only - no internal types
+from .query_plan import QueryPlan, ColumnSelectionAnalysis, ColumnSelectionIntent  # Canonical plan types
 from .confidence_gate import ConfidenceGate
 from .dialect_adapter import get_adapter
 
@@ -64,7 +65,7 @@ class SemanticQueryResult:
     """Result from semantic orchestrator."""
     success: bool
     sql: str  # Rendered SQL ready for execution
-    plan: Optional[QueryPlan]  # The generated plan (if successful)
+    plan: Optional[QueryPlan]  # The generated canonical plan (if successful)
     retrieval_context: Optional[RetrievalContext]  # What was retrieved
     confidence_score: float  # Final confidence (0.0-1.0)
     clarification_needed: bool  # If true, user asked for clarification
@@ -129,9 +130,9 @@ class SemanticQueryOrchestrator:
         """Initialize/refresh semantic catalog from database."""
         if self._catalog is None:
             logger.info("[SEMANTIC] Initializing semantic catalog...")
-            self._catalog = SemanticSchemaCatalog()  # ✅ Fixed API: no args to __init__
+            self._catalog = SemanticSchemaCatalog()  # âœ… Fixed API: no args to __init__
             
-            # ✅ Fixed API: pass adapter and session to populate_from_database
+            # âœ… Fixed API: pass adapter and session to populate_from_database
             from .database_adapter import get_global_adapter
             adapter = get_global_adapter()
             await self._catalog.populate_from_database(adapter, self.db_session)
@@ -142,7 +143,7 @@ class SemanticQueryOrchestrator:
             # Check if TTL expired
             if self._catalog_loaded_at and datetime.now() - self._catalog_loaded_at > self.catalog_ttl:
                 logger.info("[SEMANTIC] Catalog TTL expired, refreshing...")
-                # ✅ Fixed API: pass adapter and session to populate_from_database
+                # âœ… Fixed API: pass adapter and session to populate_from_database
                 from .database_adapter import get_global_adapter
                 adapter = get_global_adapter()
                 await self._catalog.populate_from_database(adapter, self.db_session)
@@ -282,32 +283,39 @@ Always return valid JSON with your best semantic judgment."""
         
         try:
             import json
-            # Extract JSON from response (LLM might add text around it)
-            json_match = response.find('{')
-            json_end = response.rfind('}') + 1
-            if json_match >= 0 and json_end > json_match:
-                json_str = response[json_match:json_end]
-                analysis_data = json.loads(json_str)
-                
+            import re
+            # Robustly extract the first top-level JSON object from the LLM response.
+            # find('{') / rfind('}') fails when the response contains multiple objects or
+            # surrounding text with braces.  Using a regex with DOTALL is more reliable.
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                analysis_data = json.loads(json_match.group(0))
+
                 intent_str = analysis_data.get("intent", "all_columns")
-                intent = ColumnSelectionIntent(intent_str)
-                
+                try:
+                    intent = ColumnSelectionIntent(intent_str)
+                except ValueError:
+                    logger.warning("[SEMANTIC] Unknown intent '%s' from LLM, defaulting to ALL_COLUMNS", intent_str)
+                    intent = ColumnSelectionIntent.ALL_COLUMNS
+
                 result = ColumnSelectionAnalysis(
                     intent=intent,
                     requested_columns=analysis_data.get("requested_columns", []),
                     reasoning=analysis_data.get("reasoning", ""),
                     user_mentions_columns=analysis_data.get("user_mentions_columns", False),
                     user_mentions_all=analysis_data.get("user_mentions_all", False),
-                    confidence=analysis_data.get("confidence", 0.8),
+                    confidence=float(analysis_data.get("confidence", 0.8)),
                 )
-                
+
                 logger.info(
-                    f"[SEMANTIC] Column Selection Analysis: intent={result.intent}, "
-                    f"columns={len(result.requested_columns)}, confidence={result.confidence:.2f}"
+                    "[SEMANTIC] Column Selection Analysis: intent=%s, columns=%d, confidence=%.2f",
+                    result.intent, len(result.requested_columns), result.confidence,
                 )
                 return result
+        except json.JSONDecodeError as e:
+            logger.warning("[SEMANTIC] JSON parse error in column analysis: %s", e)
         except Exception as e:
-            logger.warning(f"[SEMANTIC] Failed to parse column analysis: {e}")
+            logger.warning("[SEMANTIC] Failed to parse column analysis: %s", e)
         
         # Fallback: If LLM parsing completely fails, default to ALL_COLUMNS for better UX
         # No hardcoded keyword matching - all semantic intelligence from LLM
@@ -395,10 +403,10 @@ Always return valid JSON with your best semantic judgment."""
             }
             
             # Stage 3: Generate plan (LLM) - REQUIREMENT C: Plan-first generation
-            # ✅ LLM now emits QueryPlan JSON (not raw SQL), enabling deterministic rendering
+            # âœ… LLM now emits canonical QueryPlan JSON (not raw SQL), enabling deterministic rendering
             trace[PipelineStage.PLAN_GENERATION] = "starting"
             
-            # ✅ NEW: Pass table metadata with actual sample values to plan generator
+            # âœ… NEW: Pass table metadata with actual sample values to plan generator
             # This enables dynamic filter value extraction instead of hardcoding
             table_metadata = {
                 table_name: {
@@ -417,7 +425,7 @@ Always return valid JSON with your best semantic judgment."""
             )
             trace[PipelineStage.PLAN_GENERATION] = {"plan_type": "query_plan", "table": plan.from_table}
             
-            # ✅ NEW: Check if LLM indicates clarification is needed (ChatGPT-style)
+            # âœ… NEW: Check if LLM indicates clarification is needed (ChatGPT-style)
             # BUT: For follow-ups with context, SKIP this and force execution with previous table
             # This allows refinements like "what about those in delhi" to work immediately
             skip_clarification_for_followup = is_followup_with_context
@@ -489,7 +497,7 @@ Always return valid JSON with your best semantic judgment."""
             
             trace[PipelineStage.CONFIDENCE_CHECK] = {"needs_clarification": False}
             
-            # Stage 5: Render to SQL (dialect-aware)
+            # Stage 5: Render to SQL via CANONICAL pipeline (dialect-aware)
             trace[PipelineStage.RENDERING] = "starting"
             # Detect database dialect from session
             dialect_name = "postgresql"  # default
@@ -503,8 +511,10 @@ Always return valid JSON with your best semantic judgment."""
             adapter = get_adapter(dialect_name)
             dialect_val = adapter.dialect.value if hasattr(adapter.dialect, 'value') else str(adapter.dialect)
             dialect = dialect_val
-            renderer = QueryPlanRenderer(dialect=dialect)
-            sql = renderer.render(plan)
+            
+            # CANONICAL PIPELINE: plan is already canonical QueryPlan - compile directly
+            from .query_plan_compiler import compile_query_plan
+            sql = compile_query_plan(plan, dialect=dialect)
             trace[PipelineStage.RENDERING] = {"dialect": dialect, "sql_length": len(sql)}
             
             # Stage 6: Safety validation
@@ -635,7 +645,7 @@ Always return valid JSON with your best semantic judgment."""
         This is more stable than full SQL regeneration.
         
         Args:
-            anchor_plan: The plan from previous query
+            anchor_plan: The canonical plan from previous query
             followup_query: The follow-up user request
             retrieval_context: Retrieved schema context
             
@@ -714,81 +724,9 @@ RESPOND WITH ONLY THIS JSON (no markdown):
             logger.warning(f"[PLAN EDITS] Generation failed: {e}")
             return None
     
-    def apply_plan_edits(self, anchor_plan: QueryPlan, edits: List[Dict]) -> QueryPlan:
-        """
-        Deterministically apply edits to a plan.
-        
-        Supports: add_filter, remove_filter, set_limit, add_order_by, etc.
-        
-        Args:
-            anchor_plan: Original plan
-            edits: List of edit operations
-            
-        Returns:
-            Updated plan (new instance)
-        """
-        import copy
-        from .query_plan_generator import WhereCondition, RightKind, OrderByField, OrderDirection
-        
-        # Clone the plan
-        updated_plan = copy.deepcopy(anchor_plan)
-        
-        for edit in edits:
-            op = edit.get("op")
-            
-            if op == "add_filter":
-                # Add a WHERE condition
-                cond = WhereCondition(
-                    left=edit.get("left"),
-                    operator=edit.get("operator", "="),
-                    right=edit.get("right"),
-                    right_kind=RightKind(edit.get("right_kind", "literal"))
-                )
-                updated_plan.where_conditions.append(cond)
-                logger.debug(f"[PLAN EDIT] Added filter: {cond.left} {cond.operator} {cond.right}")
-            
-            elif op == "remove_filter":
-                # Remove a WHERE condition by index
-                idx = edit.get("filter_index", 0)
-                if 0 <= idx < len(updated_plan.where_conditions):
-                    removed = updated_plan.where_conditions.pop(idx)
-                    logger.debug(f"[PLAN EDIT] Removed filter at index {idx}")
-            
-            elif op == "set_limit":
-                # Set LIMIT
-                updated_plan.limit = int(edit.get("value", 100))
-                logger.debug(f"[PLAN EDIT] Set limit to {updated_plan.limit}")
-            
-            elif op == "set_offset":
-                # Set OFFSET
-                updated_plan.offset = int(edit.get("value", 0))
-                logger.debug(f"[PLAN EDIT] Set offset to {updated_plan.offset}")
-            
-            elif op == "add_order_by":
-                # Add ORDER BY
-                field = OrderByField(
-                    column=edit.get("column"),
-                    direction=OrderDirection(edit.get("direction", "ASC"))
-                )
-                updated_plan.order_by.append(field)
-                direction_val = field.direction.value if hasattr(field.direction, 'value') else str(field.direction)
-                logger.debug(f"[PLAN EDIT] Added order by: {field.column} {direction_val}")
-            
-            elif op == "set_group_by":
-                # Set GROUP BY (replaces existing)
-                updated_plan.group_by = edit.get("columns", [])
-                logger.debug(f"[PLAN EDIT] Set group by: {updated_plan.group_by}")
-            
-            elif op == "set_distinct":
-                # Set DISTINCT
-                updated_plan.distinct = edit.get("value", True)
-                logger.debug(f"[PLAN EDIT] Set distinct to {updated_plan.distinct}")
-            
-            else:
-                logger.warning(f"[PLAN EDIT] Unknown operation: {op}")
-        
-        logger.info(f"[PLAN EDITS] Applied {len(edits)} edits to plan")
-        return updated_plan
+    # NOTE: apply_plan_edits has been REMOVED (was dead code using internal types).
+    # Plan modifications should be done on canonical QueryPlan directly.
+    # See query_plan.py for the canonical QueryPlan type.
 
 
 async def create_semantic_orchestrator(
@@ -806,3 +744,4 @@ async def create_semantic_orchestrator(
     )
     await orchestrator.initialize_catalog()
     return orchestrator
+

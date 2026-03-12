@@ -7,7 +7,8 @@ This router uses multiple stages to efficiently and accurately route queries:
 3. LLM Semantic: Full context analysis for complex cases (< 500ms)
 4. Context Acceleration: Use session history to speed decisions
 
-Performance: 95% of queries routed in < 10ms, 100% accuracy maintained.
+Performance: 95% of queries routed in < 10ms, near-100% accuracy maintained.
+Note: Final routing authority is the DecisionArbiter, not this router.
 """
 
 from __future__ import annotations
@@ -46,27 +47,118 @@ class IntentTemplate:
 
 class EfficientQueryRouter:
     """Multi-stage intelligent query router with performance optimization."""
-    
+
+    _db_entity_pattern: Optional[re.Pattern] = None
+
     def __init__(self, db: AsyncSession):
         self.db = db
         self.semantic_router = SemanticIntentRouter(db)
         self._initialize_patterns()
         self._initialize_intent_templates()
+
+    def _get_db_entity_pattern(self) -> re.Pattern:
+        """Build a regex pattern from actual DB table names via SchemaIntelligenceService.
+
+        Falls back to a broad word pattern if the service has no tables loaded yet.
+        The result is cached on the class so it is computed at most once per process.
+        """
+        if EfficientQueryRouter._db_entity_pattern is not None:
+            return EfficientQueryRouter._db_entity_pattern
+
+        try:
+            from app.services.schema_intelligence_service import get_schema_intelligence
+            svc = get_schema_intelligence()
+            table_names = list(svc.table_profiles.keys()) if svc.table_profiles else []
+        except Exception:
+            table_names = []
+
+        if table_names:
+            # Add plural/singular variants
+            extended: List[str] = list(table_names)
+            for t in table_names:
+                if t.endswith('s'):
+                    extended.append(t[:-1])
+                else:
+                    extended.append(t + 's')
+            # Deduplicate while preserving order
+            seen: Dict[str, None] = {}
+            for name in extended:
+                seen[name] = None
+            pattern_str = '|'.join(re.escape(n) for n in seen)
+            compiled = re.compile(pattern_str, re.I)
+        else:
+            # No tables loaded yet — match any word token as broad fallback
+            compiled = re.compile(r'\w+', re.I)
+
+        EfficientQueryRouter._db_entity_pattern = compiled
+        return compiled
         
     def _initialize_patterns(self):
-        """Initialize fast pattern matching rules for Stage 1."""
+        """Initialize fast pattern matching rules for Stage 1.
         
-        # SQL/Database patterns - high confidence
+        FIX: Follow-up patterns are now checked FIRST to prevent the router from
+        treating conversational follow-ups as new SQL queries.
+        
+        FIX: Expanded follow-up patterns to cover ellipsis, anaphora, and
+        conversational continuations that are commonly missed.
+        """
+        
+        # CRITICAL FIX: Follow-up patterns FIRST - these MUST be checked before SQL patterns
+        # to catch conversational continuations like "list all those clients"
+        # File-related words — when "this/that" precedes these, it means the user
+        # is talking about a file/document, not a SQL follow-up continuation.
+        _FILE_NOUN = r'(file|document|upload|attachment|pdf|csv|xlsx?|spreadsheet|report)'
+
+        followup_patterns = [
+            # ===== REFERENTIAL EXPRESSIONS (anaphora) =====
+            # These indicate the query refers to previous context.
+            # Negative lookahead: skip if followed by a file noun (e.g. "this file").
+            re.compile(r'\b(those|them|these|that|this|it|they)\b(?!\s*' + _FILE_NOUN + r')', re.I),
+            re.compile(r'\b(the\s+)?same\s+(ones?|data|results?|records?)', re.I),
+            re.compile(r'\b(above|previous|earlier|before)\b', re.I),
+            re.compile(r'\b(that\s+data|those\s+results?|the\s+ones?)', re.I),
+
+            # ===== MODIFICATION INDICATORS =====
+            # These indicate modifications to previous results
+            re.compile(r'\b(now|also|additionally)\s+(add|include|filter|show)', re.I),
+            re.compile(r'\b(only|just|but|except|excluding|including)\b', re.I),
+            re.compile(r'\b(for|only|just|excluding)\s+(20\d{2}|last|this)\b(?!\s*' + _FILE_NOUN + r')', re.I),
+            
+            # ===== GROUPING/SORTING MODIFICATIONS =====
+            re.compile(r'\bbreak\s+(it\s+)?(down\s+)?(by|into)', re.I),
+            re.compile(r'\b(group|sort|order)\s+(them|it|by)\b', re.I),
+            re.compile(r'\b(month|year|week|day)\s*(-?wise|by)\b', re.I),
+            
+            # ===== LIMIT/PAGINATION =====
+            re.compile(r'\b(top|first|last|next|bottom)\s+\d+', re.I),
+            # REMOVED: Too broad pattern that matches standalone queries
+            # re.compile(r'\bshow\s+(me\s+)?(more|less|all)\b', re.I),
+            
+            # ===== FILTER ADDITIONS =====
+            re.compile(r'\b(only\s+)?(the\s+)?(approved|pending|active|inactive)\s+(ones?)?', re.I),
+            re.compile(r'\b(in|for|from|during)\s+(Q[1-4]|january|february|march|april|may|june|july|august|september|october|november|december)', re.I),
+            
+            # ===== CONTINUATIONS =====
+            # Only match if there's explicit reference to previous results
+            re.compile(r'\blist\s+(all\s+)?(of\s+)?(those|them|these)', re.I),
+            re.compile(r'\bshow\s+(me\s+)?(all\s+)?(those|them|these)', re.I),  # Removed "the details" - too broad
+            re.compile(r'\bget\s+(me\s+)?(all\s+)?(those|them|these)', re.I),
+        ]
+        
+        # SQL/Database patterns - high confidence (checked AFTER follow-up)
+        _entity_pat = self._get_db_entity_pattern()
         sql_patterns = [
-            re.compile(r'\b(show|get|list|find|select)\s+(me\s+)?(all\s+)?(the\s+)?'
-                      r'(clients|customers|users|sales|orders|products|data|records)', re.I),
+            # Broad entity queries - entity list built dynamically from DB tables
+            re.compile(
+                r'\b(show|get|list|find|select)\s+(me\s+)?(all\s+)?(the\s+)?(' + _entity_pat.pattern + r')',
+                re.I,
+            ),
             re.compile(r'\bhow\s+many\s+.+\s+(are|were|in)', re.I),
             re.compile(r'\b(total|sum|count|average|max|min)\s+\w+', re.I),
-            re.compile(r'\b(top|bottom)\s+\d+', re.I),
             re.compile(r'\bgroup\s+by\b|\border\s+by\b|\bwhere\b', re.I),
-            re.compile(r'\b(sales|revenue) (by|for|in|from)', re.I),
+            re.compile(r'\b(sales|revenue)\s+(by|for|in|from)', re.I),
             re.compile(r'\b(database|sql|query|table)\s+(data|analysis|report)', re.I),
-            re.compile(r'\ball\s+(the\s+)?(clients|customers|users|records)', re.I),
+            re.compile(r'\ball\s+(the\s+)?(' + _entity_pat.pattern + r')', re.I),
         ]
         
         # File analysis patterns - high confidence  
@@ -87,20 +179,19 @@ class EfficientQueryRouter:
             re.compile(r'\b(thank\s+you|thanks|bye|goodbye)', re.I),
         ]
         
-        # Follow-up patterns
-        followup_patterns = [
-            re.compile(r'\b(now|also|additionally)\s+(add|include|filter|show)', re.I),
-            re.compile(r'\b(for|only|just|excluding)\s+(20\d{2}|last|this)', re.I), 
-            re.compile(r'\b(top|first|last|next)\s+\d+', re.I),
-            re.compile(r'\bbreak\s+(it\s+)?(down\s+)?(by|into)', re.I),
-        ]
-        
+        # CRITICAL FIX: Follow-up patterns are now FIRST in the list
+        # The _match_patterns function iterates in order, so this ensures
+        # follow-up queries are detected before being misclassified as new SQL queries
         self.routing_patterns = [
-            RoutingPattern(sql_patterns, schemas.Tool.RUN_SQL, 0.95),
-            RoutingPattern(file_patterns, schemas.Tool.ANALYZE_FILE, 0.95),
-            RoutingPattern(chat_patterns, schemas.Tool.CHAT, 0.85),
-            RoutingPattern(followup_patterns, schemas.Tool.RUN_SQL, 0.75, 
+            # FIRST: Check for follow-up (prevents "list all those" being treated as new query)
+            RoutingPattern(followup_patterns, schemas.Tool.RUN_SQL, 0.80, 
                           schemas.FollowupType.RUN_SQL_FOLLOW_UP),
+            # SECOND: File patterns (specific, should not conflict)
+            RoutingPattern(file_patterns, schemas.Tool.ANALYZE_FILE, 0.95),
+            # THIRD: Chat patterns (greetings, very specific)
+            RoutingPattern(chat_patterns, schemas.Tool.CHAT, 0.85),
+            # LAST: SQL patterns (catch-all for database queries)
+            RoutingPattern(sql_patterns, schemas.Tool.RUN_SQL, 0.90),  # Lower confidence since follow-up checked first
         ]
     
     def _initialize_intent_templates(self):
@@ -230,19 +321,31 @@ class EfficientQueryRouter:
                         confidence = 0.6
                     
                     # Safety: Follow-ups require previous state
+                    # FIX: If no previous SQL context exists, treat follow-up patterns as NEW_QUERY
+                    # but still return RUN_SQL tool (correct behavior)
+                    is_followup_without_context = False
                     if (followup != schemas.FollowupType.NEW_QUERY and 
                         not hard_signals.last_sql_exists and 
                         not hard_signals.last_file_context_exists):
                         followup = schemas.FollowupType.NEW_QUERY
+                        is_followup_without_context = True
                     
                     return schemas.RouterDecision(
                         tool=tool,
                         followup_type=followup,
                         confidence=confidence,
-                        reasoning=f"Pattern matched: {pattern.pattern}",
+                        reasoning=f"Pattern matched: {pattern.pattern}" + 
+                                 (" (no previous context)" if is_followup_without_context else ""),
                         needs_clarification=False,
                         clarification_questions=[],
-                        signals_used={"stage": "pattern_matching", "pattern": pattern.pattern},
+                        signals_used={
+                            "stage": "pattern_matching", 
+                            "pattern": pattern.pattern,
+                            # FIX: Mark this decision as PROVISIONAL - the arbiter makes the final call
+                            "is_provisional": True,
+                            "followup_pattern_matched": followup == schemas.FollowupType.RUN_SQL_FOLLOW_UP,
+                            "had_previous_context": hard_signals.last_sql_exists,
+                        },
                     )
         
         return None
@@ -269,9 +372,10 @@ class EfficientQueryRouter:
                 if total_words > 0:
                     similarity = overlap / total_words
                     
-                    # Boost score if query contains template keywords
+                    # Boost score if query contains template keywords.
+                    # Clamp immediately so the score stays in [0, 1].
                     if any(keyword.lower() in user_query.lower() for keyword in template.keywords):
-                        similarity += 0.2
+                        similarity = min(similarity + 0.2, 1.0)
                     
                     if similarity > best_score and similarity > 0.3:  # Minimum threshold
                         best_score = similarity

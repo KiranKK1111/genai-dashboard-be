@@ -2,16 +2,70 @@
 
 from __future__ import annotations
 
+from typing import Dict, List
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 
 
+async def get_business_table_names(session: AsyncSession) -> List[str]:
+    """Return the list of business-visible table names (excludes internal tables).
+
+    Lightweight — only fetches table names, no column or sample-value queries.
+    Used to pass the table list to the LLM concept extractor so it maps
+    user synonyms (e.g. 'clients') to real table names (e.g. 'customers').
+    """
+    target_schema = settings.postgres_schema
+    result = await session.execute(
+        text(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = :schema ORDER BY table_name"
+        ),
+        {"schema": target_schema},
+    )
+    all_tables = [row[0] for row in result.fetchall()]
+
+    if settings.discover_all_tables:
+        return all_tables
+    if settings.allowed_tables:
+        allowed = set(settings.allowed_tables)
+        return [t for t in all_tables if t in allowed]
+    # Default: exclude internal tables
+    internal = set(settings.internal_tables or [])
+    return [t for t in all_tables if t not in internal]
+
+
+async def get_business_table_schemas(session: AsyncSession) -> Dict[str, List[str]]:
+    """Return {table_name: [column_names]} for business tables.
+
+    Lightweight — only fetches column names (no types, no sample values).
+    Used to give the concept extractor actual column names so it maps
+    user concepts (e.g. 'city') to real columns instead of guessing.
+    """
+    tables = await get_business_table_names(session)
+    if not tables:
+        return {}
+    target_schema = settings.postgres_schema
+    result = await session.execute(
+        text(
+            "SELECT table_name, column_name "
+            "FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = ANY(:tables) "
+            "ORDER BY table_name, ordinal_position"
+        ),
+        {"schema": target_schema, "tables": tables},
+    )
+    schemas: Dict[str, List[str]] = {}
+    for row in result.fetchall():
+        schemas.setdefault(row[0], []).append(row[1])
+    return schemas
+
+
 async def get_database_schema(session: AsyncSession) -> str:
     """Fetch database schema dynamically from PostgreSQL.
     
-    Retrieves all tables and their columns from the 'genai' schema
+    Retrieves all tables and their columns from the configured schema
     including sample values, primary keys, and foreign keys to help LLM understand data relationships.
     
     Args:
@@ -74,7 +128,7 @@ async def get_database_schema(session: AsyncSession) -> str:
                 LEFT JOIN information_schema.table_constraints tc ON c.table_name = tc.table_name AND tc.constraint_type = 'PRIMARY KEY'
                 LEFT JOIN information_schema.key_column_usage kcu ON c.column_name = kcu.column_name AND c.table_name = kcu.table_name AND kcu.constraint_name = tc.constraint_name
                 LEFT JOIN information_schema.columns pk ON kcu.column_name = pk.column_name
-                WHERE c.table_schema = 'genai' AND c.table_name = '{table_name}'
+                WHERE c.table_schema = '{target_schema}' AND c.table_name = '{table_name}'
                 ORDER BY c.ordinal_position;
             """)
             

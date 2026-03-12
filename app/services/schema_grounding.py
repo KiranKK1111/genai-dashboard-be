@@ -26,8 +26,9 @@ logger = logging.getLogger(__name__)
 class SchemaGroundingContext:
     """Creates and manages grounded schema context for LLM prompts."""
 
-    def __init__(self, schema_name: str = "genai"):
-        self.schema_name = schema_name
+    def __init__(self, schema_name: Optional[str] = None):
+        from app.config import settings as _settings
+        self.schema_name = schema_name or _settings.postgres_schema
         self.tables: Dict[str, Dict] = {}
         self.relationships: List[Dict] = []
         self.enum_values: Dict[str, List[str]] = {}
@@ -279,7 +280,7 @@ CRITICAL CONSTRAINT FOR SQL GENERATION:
 1. ONLY use tables and columns listed above. NO EXCEPTIONS.
 2. For filters, ONLY use values from the ENUM ALLOWED VALUES list.
 3. For JOINs, ONLY use paths from JOIN PATHS above.
-4. Always use schema-qualified names: genai.table_name
+4. Always use schema-qualified names: {self.schema_name}.table_name
 5. If a table/column is not listed above, it does not exist in this database.
 6. For text filters (like status, category), use EXACT values from samples shown.
 7. Never invent tables, columns, or values.
@@ -299,7 +300,7 @@ CRITICAL CONSTRAINT FOR SQL GENERATION:
 async def create_schema_grounding(
     inspector,
     session: AsyncSession,
-    schema_name: str = "genai"
+    schema_name: Optional[str] = None,
 ) -> SchemaGroundingContext:
     """Factory function to create and populate schema grounding."""
     grounding = SchemaGroundingContext(schema_name)

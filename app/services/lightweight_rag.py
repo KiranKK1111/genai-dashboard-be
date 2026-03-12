@@ -302,7 +302,7 @@ class LightweightRAG:
                 # Step 1: Try exact hash match (instant)
                 if embedding_record.query_hash == current_fp.query_hash:
                     score = 1.0
-                    logger.info(f"[LIGHTWEIGHT_RAG] ✅ Exact hash match for query: {embedding_record.user_query[:40]}...")
+                    logger.info(f"[LIGHTWEIGHT_RAG] ✅ Exact hash match for query: {embedding_record.user_query}")
                 else:
                     # Step 2: Structure matching
                     try:
@@ -398,7 +398,7 @@ class LightweightRAG:
             await self.db_session.flush()  # Flush to check for errors
             await self.db_session.commit()  # Commit if flush succeeded
             
-            logger.info(f"[LIGHTWEIGHT_RAG] ✅ Stored query fingerprint: {query_id[:8]}...")
+            logger.info(f"[LIGHTWEIGHT_RAG] ✅ Stored query fingerprint: {query_id}")
             return True
             
         except Exception as e:

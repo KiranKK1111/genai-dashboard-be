@@ -36,8 +36,9 @@ class FilterValueMetadata:
 class FilterValueGrounding:
     """Manages valid filter values for grounded SQL generation."""
 
-    def __init__(self, schema_name: str = "genai"):
-        self.schema_name = schema_name
+    def __init__(self, schema_name: Optional[str] = None):
+        from app.config import settings as _settings
+        self.schema_name = schema_name or _settings.postgres_schema
         self.filter_metadata: Dict[Tuple[str, str], FilterValueMetadata] = {}
         self.user_query_terms: Set[str] = set()
 

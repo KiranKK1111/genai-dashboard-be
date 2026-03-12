@@ -240,8 +240,11 @@ class QueryCoverageVerifier:
     
     def _verify_gender_coverage(self, query: str, sql: str) -> ConceptCoverage:
         """Verify gender filter coverage"""
-        # Check if query mentions gender
-        has_gender_query = any(indicator in query for indicator in self.gender_indicators)
+        # Check if query mentions gender (word-boundary match to avoid "man" in "many")
+        has_gender_query = any(
+            re.search(r'\b' + re.escape(indicator) + r'\b', query, re.IGNORECASE)
+            for indicator in self.gender_indicators
+        )
         
         if not has_gender_query:
             return ConceptCoverage(

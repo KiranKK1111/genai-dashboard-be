@@ -343,15 +343,45 @@ class ToolCall:
             "error": self.error_message,
             "duration_ms": self.duration_ms(),
         }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> ToolCall:
+        """Reconstruct from dictionary."""
+        import uuid
+        from datetime import datetime
+        
+        # Handle tool_type conversion
+        tool_type_str = data.get("tool_type", "SQL_QUERY")
+        try:
+            tool_type = ToolType(tool_type_str)
+        except ValueError:
+            # Fallback for unknown tool types
+            tool_type = ToolType.SQL_QUERY
+        
+        return cls(
+            id=data.get("id", str(uuid.uuid4())),
+            tool_type=tool_type,
+            input_json=data.get("input", {}),
+            output_json=data.get("output", {}),
+            success=data.get("success", True),
+            error_message=data.get("error"),
+            start_time=datetime.utcnow(),  # Simplified for now
+            end_time=datetime.utcnow() if data.get("success", True) else None,
+        )
 
 
 # ============================================================================
 # PART 3: Follow-up Classification (7 Types)
 # ============================================================================
 
-class FollowUpType(Enum):
-    """Classification of follow-up query types."""
-    
+class SessionFollowUpType(Enum):
+    """Session-level follow-up type used for state merging inside SessionStateManager.
+
+    This is intentionally distinct from ``followup_manager.FollowUpType``, which
+    classifies routing signals.  This enum drives *how* session state is merged
+    (filters kept/dropped, aggregation reset, etc.) when a follow-up is detected.
+    """
+
     NEW_REQUEST = "new_request"  # Unrelated to previous query
     REFINE = "refine"  # Add/modify filters, time range, limit to same query
     TRANSFORM = "transform"  # Change aggregation/visualization (group_by, sort, etc.)
@@ -360,6 +390,11 @@ class FollowUpType(Enum):
     COMPARE = "compare"  # Compare A vs B
     EXPLAIN = "explain"  # No SQL, just explanation of previous result
     RESET = "reset"  # Start over
+
+
+# Backward-compatibility alias so any existing code importing FollowUpType from
+# this module continues to work without modification.
+FollowUpType = SessionFollowUpType
 
 
 # ============================================================================
@@ -848,14 +883,22 @@ class SessionStateManager:
     
     def to_session_dict(self) -> Dict[str, Any]:
         """Export session state for database persistence."""
-        return {
+        result = {
             "session_id": self.session_id,
             "user_id": self.user_id,
             "last_query_state": self.last_query_state.to_dict() if self.last_query_state else None,
             "tool_calls": [tc.to_dict() for tc in self.tool_calls],
+            "messages": self.messages,  # ✅ CRITICAL FIX: Save messages for SQL conversation history
             "message_count": len(self.messages),
             "state_updated_at": datetime.utcnow().isoformat(),
         }
+        
+        # DEBUG: Log what's being exported
+        print(f"[SESSION_MANAGER] to_session_dict: exporting {len(self.messages)} messages")
+        print(f"[SESSION_MANAGER] to_session_dict: exporting {len(self.tool_calls)} tool_calls")
+        print(f"[SESSION_MANAGER] to_session_dict: total size {len(str(result))} bytes")
+        
+        return result
     
     @classmethod
     def from_session_dict(cls, data: Dict[str, Any], session_id: str = None, user_id: str = None) -> SessionStateManager:
@@ -867,6 +910,15 @@ class SessionStateManager:
             session_id: Current session ID (passed separately, not stored in state dict)
             user_id: Current user ID (passed separately, not stored in state dict)
         """
+        
+        # DEBUG: Log what's being loaded
+        print(f"[SESSION_MANAGER] from_session_dict: received {len(str(data))} bytes")
+        print(f"[SESSION_MANAGER] from_session_dict: keys in data: {list(data.keys()) if data else 'NO DATA'}")
+        if data and 'messages' in data:
+            print(f"[SESSION_MANAGER] from_session_dict: loading {len(data['messages'])} messages")
+        else:
+            print(f"[SESSION_MANAGER] from_session_dict: NO messages in data")
+        
         # Use passed-in session_id/user_id, or fall back to dict values (if upgrading from old format)
         manager = cls(
             session_id=session_id or data.get("session_id"),
@@ -875,5 +927,17 @@ class SessionStateManager:
         
         if data.get("last_query_state"):
             manager.last_query_state = QueryState.from_dict(data["last_query_state"])
+        
+        # ✅ CRITICAL FIX: Load tool_calls from session state
+        if data.get("tool_calls"):
+            manager.tool_calls = [ToolCall.from_dict(tc) for tc in data["tool_calls"]]
+        
+        # ✅ CRITICAL FIX: Load messages for SQL conversation history
+        if data.get("messages"):
+            manager.messages = data["messages"]
+        
+        # DEBUG: Log what was loaded
+        print(f"[SESSION_MANAGER] from_session_dict: loaded {len(manager.messages)} messages")
+        print(f"[SESSION_MANAGER] from_session_dict: loaded {len(manager.tool_calls)} tool_calls")
         
         return manager

@@ -484,20 +484,64 @@ async def migrate_update_embedding_dimensions(session: AsyncSession) -> None:
         print(f"[WARNING] Embedding dimension update had issues: {e}")
 
 
+async def migrate_add_chat_session_title_and_updated_at(session: AsyncSession) -> None:
+    """
+    Add 'title' and 'updated_at' columns to chat_sessions table.
+
+    These are used for ChatGPT-style session rename and ordering by last activity.
+    Idempotent — safe to run when columns already exist.
+    """
+    schema = get_schema()
+    print("\n[MIGRATION] Adding title/updated_at columns to chat_sessions...")
+
+    migrations = [
+        f"""
+        ALTER TABLE {schema}.chat_sessions
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE
+            DEFAULT CURRENT_TIMESTAMP;
+        """,
+        f"""
+        ALTER TABLE {schema}.chat_sessions
+        ADD COLUMN IF NOT EXISTS title VARCHAR(255) DEFAULT NULL;
+        """,
+        # Back-fill updated_at from created_at for existing rows
+        f"""
+        UPDATE {schema}.chat_sessions
+        SET updated_at = created_at
+        WHERE updated_at IS NULL;
+        """,
+    ]
+
+    for i, sql in enumerate(migrations, 1):
+        try:
+            await session.execute(text(sql))
+            await session.commit()
+            print(f"[OK] chat_sessions migration {i} completed")
+        except Exception as e:
+            await session.rollback()
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                print(f"[OK] chat_sessions migration {i}: already applied (skipped)")
+            else:
+                print(f"[ERROR] chat_sessions migration {i} failed: {e}")
+                raise
+
+
 async def run_all_migrations(session: AsyncSession) -> None:
     """Run all pending database migrations."""
     schema = get_schema()
     print("\n" + "="*60)
     print("RUNNING DATABASE MIGRATIONS")
     print("="*60)
-    
+
     try:
         # Set search path to configured schema
         await session.execute(text(f"SET search_path TO {schema}, public"))
-        
+
         # Run migrations in order
         await migrate_add_session_state_columns(session)
         await migrate_add_result_schema_columns(session)
+        # Add title + updated_at columns used for session rename & ordering
+        await migrate_add_chat_session_title_and_updated_at(session)
         await migrate_create_tool_calls_table(session)
         await migrate_setup_pgvector(session)  # Set up pgvector for RAG embeddings
         await migrate_update_query_embeddings_all_result_rows(session)  # Add all_result_rows column

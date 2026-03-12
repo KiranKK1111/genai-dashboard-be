@@ -194,7 +194,7 @@ class MasterOrchestrator:
         Returns:
             TaskIntent with interpreted information
         """
-        logger.info(f"[TASK INTERPRETER] Analyzing query: {user_query[:100]}...")
+        logger.info(f"[TASK INTERPRETER] Analyzing query: {user_query}")
         
         prompt = f"""You are an AI task interpreter. Analyze the user query and extract structured intent.
 

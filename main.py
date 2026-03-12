@@ -16,18 +16,26 @@ Note: This project uses asynchronous SQLAlchemy and requires a
 PostgreSQL database. Dependencies are specified in ``requirements.txt``.
 """
 
+import asyncio
 import logging
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import HTTPException, RequestValidationError
+from app.middleware.exception_handler import (
+    global_exception_handler,
+    http_exception_handler,
+    validation_exception_handler,
+)
+from app.middleware.rate_limiter import limiter, rate_limit_exceeded_handler
 
 from app.config import settings
-from app.database import init_db, Base, SessionLocal, dispose_engine
-from app.models import User, ChatSession, Message, UploadedFile, FileChunk
+from app.database import init_db, SessionLocal, dispose_engine
+import app.models as _models; _ = _models  # registers ORM models with SQLAlchemy metadata
 from app.routes import router as api_router
 from app.services import (
     UnifiedSemanticRouter,
-    HardSignalsExtractor,
     DynamicSqlSafetyValidator,
     SafetySqlConfig,
     SqlStatementType,
@@ -44,7 +52,7 @@ from app.services import (
 
 # Configure logging to write all logs to app.log
 def configure_logging():
-    """Configure unified logging to app.log file."""
+    """Configure unified logging to app.log file (idempotent - safe to call multiple times)."""
     from logging.handlers import RotatingFileHandler
     import os
     
@@ -53,9 +61,16 @@ def configure_logging():
     
     # Configure root logger
     root_logger = logging.getLogger()
+    
+    # GUARD: Check if already configured by looking for existing handlers
+    # with our specific formatter pattern to avoid duplicate initialization
+    for handler in root_logger.handlers:
+        if isinstance(handler, RotatingFileHandler) and 'app.log' in str(handler.baseFilename):
+            return  # Already configured with our handler, skip
+    
     root_logger.setLevel(logging.INFO)
     
-    # Remove any existing handlers
+    # Remove any existing handlers to prevent duplicates
     root_logger.handlers.clear()
     
     # File handler - writes to app.log with rotation (10MB max, 5 backups)
@@ -101,17 +116,200 @@ def configure_logging():
 configure_logging()
 
 
-def create_app() -> FastAPI:
-    """Instantiate and configure the FastAPI application.
-
-    Returns:
-        FastAPI: the configured application instance.
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
     """
-    app = FastAPI(title="GenAI Backend Service")
+    FastAPI lifespan handler — replaces deprecated @app.on_event.
+    Everything before `yield` runs at startup; everything after at shutdown.
+    """
+    # ── STARTUP ──────────────────────────────────────────────────────────────
+    try:
+        print("=" * 70)
+        print("[STARTUP] Initializing GenAI Backend Service")
+        print("=" * 70)
 
-    # Enable CORS using settings.CORS_ORIGINS. The allowed origins can be
-    # customised via the environment. This makes the backend consumable
-    # from a web front‑end served on a different host/port.
+        print("\n[1/5] Initializing database...")
+        await init_db()
+        print("    [OK] Database initialized")
+
+        print("\n[2/5] Initializing P0-P3 services...")
+
+        # P0: Core routing
+        print("    [P0] Unified Semantic Router")
+        app.state.router = UnifiedSemanticRouter(SessionLocal)
+
+        # P1: SQL Safety Validator (magic numbers replaced with settings)
+        print("    [P1] Dynamic SQL Safety Validator")
+        sql_config = SafetySqlConfig(
+            allowed_statement_types={SqlStatementType.SELECT, SqlStatementType.WITH, SqlStatementType.UNION},
+            require_confirmation_for={SqlStatementType.INSERT, SqlStatementType.UPDATE, SqlStatementType.DELETE},
+            statement_timeout_seconds=settings.sql_statement_timeout_sec,
+            max_result_rows=settings.sql_max_result_rows,
+        )
+        app.state.sql_validator = DynamicSqlSafetyValidator(sql_config)
+
+        # P1: pgVector file retriever
+        print("    [P1] pgVector File Retriever")
+        try:
+            _dims = settings.embedding_dimensions
+
+            def embed_sync(_: str) -> list:  # real embedding is async; stub used for retriever init
+                return [0.0] * _dims
+
+            vector_config = VectorSearchConfig(
+                similarity_threshold=settings.vector_similarity_threshold,
+                top_k=settings.vector_search_top_k,
+                search_timeout_ms=settings.vector_search_timeout_ms,
+            )
+            app.state.file_retriever = PgVectorFileRetriever(SessionLocal, embed_sync, vector_config)
+        except Exception as e:
+            print(f"    [WARN] pgVector setup skipped (optional): {e}")
+            app.state.file_retriever = None
+
+        # P2: Conversation memory manager
+        print("    [P2] Conversation Memory Manager")
+        memory_config = ConversationMemoryConfig(
+            max_context_tokens=settings.memory_max_context_tokens,
+            summary_trigger_ratio=0.8,
+            token_counter_fn=lambda text: max(1, len(text) // 4),
+            keep_recent_messages=settings.memory_keep_recent_messages,
+            keep_messages_hours=settings.memory_keep_messages_hours,
+        )
+        app.state.memory_manager = ConversationMemoryManager(memory_config)
+
+        # P2: Semantic Value Grounder
+        print("    [P2] Semantic Value Grounder")
+        try:
+            from app.services.semantic_value_grounding_enhanced import get_semantic_value_grounder_enhanced
+            grounder = get_semantic_value_grounder_enhanced()
+            if not grounder.initialized:
+                print("    [P2] Warming grounder (profiling database schema)...")
+                async with SessionLocal() as db:
+                    await grounder.initialize_for_tables(db, sample_size=100)
+                print("    [P2] Grounder warmed and ready")
+            app.state.grounder = grounder
+        except Exception as e:
+            print(f"    [WARN] Grounder initialization failed (non-critical): {e}")
+            app.state.grounder = None
+
+        # P2: Privacy & Audit layer
+        print("    [P2] Privacy & Audit Layer")
+        privacy_config = PrivacyConfig(
+            redact_pii_in_logs=True,
+            retention_days_default=90,
+            retention_days_audit_log=365,
+        )
+        pii_detector = PiiDetector(privacy_config)
+        app.state.pii_detector = pii_detector
+        app.state.audit_logger = AuditLogger(SessionLocal, pii_detector, privacy_config)
+
+        # P3: Evaluation harness
+        print("    [P3] Routing Evaluation Harness")
+        from app.services import ALL_TEST_CASES
+        evaluator = RoutingEvaluationHarness(app.state.router)
+        evaluator.register_test_cases(ALL_TEST_CASES)
+        app.state.evaluator = evaluator
+
+        # Production-grade components
+        print("\n    [PROD] Production-Grade Architecture Components")
+        print("    " + "=" * 60)
+
+        print("    [PROD] Schema Intelligence Service (weighted resolution)")
+        try:
+            from app.services import get_schema_intelligence
+            schema_intel = get_schema_intelligence()
+            async with SessionLocal() as schema_db:
+                await schema_intel.initialize(schema_db)
+            app.state.schema_intelligence = schema_intel
+            print("    [PROD] Schema Intelligence initialized")
+        except Exception as e:
+            print(f"    [WARN] Schema Intelligence init failed (non-critical): {e}")
+            app.state.schema_intelligence = None
+
+        print("    [PROD] Execution Policy Engine (fast path routing)")
+        from app.services import get_execution_policy_engine
+        app.state.policy_engine = get_execution_policy_engine()
+
+        print("    [PROD] Question-Back Engine (contextual suggestions)")
+        from app.services import get_question_back_engine
+        app.state.question_engine = get_question_back_engine()
+
+        print("    [PROD] Schema Change Detector (invalidates cache on DDL)")
+        try:
+            from app.services.schema_change_detector import start_schema_change_detector
+            _schema_name = getattr(settings, "postgres_schema", "public")
+            app.state.schema_detector_task = asyncio.create_task(
+                start_schema_change_detector(SessionLocal, schema_name=_schema_name)
+            )
+            print("    [PROD] Schema Change Detector running")
+        except Exception as e:
+            print(f"    [WARN] Schema Change Detector failed (non-critical): {e}")
+            app.state.schema_detector_task = None
+
+        print("    [PROD] Background Task Queue (arq)")
+        try:
+            from app.services.task_queue import start_task_queue
+            await start_task_queue()
+            print("    [PROD] Background Task Queue ready")
+        except Exception as e:
+            print(f"    [WARN] Background Task Queue unavailable (non-critical): {e}")
+
+        print("    " + "=" * 60)
+        print("\n" + "=" * 70)
+        print("[OK] SERVICE INITIALIZATION COMPLETE")
+        print("=" * 70 + "\n")
+
+    except Exception as e:
+        print(f"\n[ERROR] Initialization error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+    yield  # ── application runs here ─────────────────────────────────────────
+
+    # ── SHUTDOWN ─────────────────────────────────────────────────────────────
+    # Cancel background tasks
+    task = getattr(app.state, "schema_detector_task", None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        from app.services.task_queue import stop_task_queue
+        await stop_task_queue()
+    except Exception as e:
+        logging.getLogger(__name__).debug("[SHUTDOWN] Task queue stop: %s", e)
+
+    try:
+        await dispose_engine()
+    except Exception as e:
+        logging.getLogger(__name__).warning("[SHUTDOWN] Engine dispose failed: %s", e)
+
+
+def create_app() -> FastAPI:
+    """Instantiate and configure the FastAPI application."""
+    app = FastAPI(title="GenAI Backend Service", lifespan=_lifespan)
+
+    # ── Exception handlers ────────────────────────────────────────────────────
+    app.add_exception_handler(Exception, global_exception_handler)
+    app.add_exception_handler(HTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)
+
+    # ── Rate limiting (slowapi) ───────────────────────────────────────────────
+    if settings.rate_limit_enabled:
+        try:
+            from slowapi import SlowAPIMiddleware
+            from slowapi.errors import RateLimitExceeded
+            app.state.limiter = limiter
+            app.add_middleware(SlowAPIMiddleware)
+            app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+        except ImportError:
+            print("[WARN] slowapi not installed — rate limiting disabled (pip install slowapi)")
+
+    # ── CORS ─────────────────────────────────────────────────────────────────
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -120,133 +318,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Initialize database on startup BEFORE including routes
-    @app.on_event("startup")
-    async def startup_event():
-        try:
-            print("=" * 70)
-            print("[STARTUP] Initializing GenAI Backend Service")
-            print("=" * 70)
-            
-            print("\n[1/5] Initializing database...")
-            await init_db()
-            print("    [OK] Database initialized")
-            
-            # ===== P0-P3 SERVICE INITIALIZATION =====
-            print("\n[2/5] Initializing P0-P3 services...")
-            
-            # P0: Core routing services
-            print("    [P0] Unified Semantic Router")
-            router = UnifiedSemanticRouter(SessionLocal)
-            app.state.router = router
-            
-            # P1: SQL Safety validator
-            print("    [P1] Dynamic SQL Safety Validator")
-            sql_config = SafetySqlConfig(
-                allowed_statement_types={SqlStatementType.SELECT, SqlStatementType.WITH, SqlStatementType.UNION},
-                require_confirmation_for={SqlStatementType.INSERT, SqlStatementType.UPDATE, SqlStatementType.DELETE},
-                statement_timeout_seconds=30,
-                max_result_rows=100000,
-            )
-            sql_validator = DynamicSqlSafetyValidator(sql_config)
-            app.state.sql_validator = sql_validator
-            
-            # P1: pgvector file retriever
-            print("    [P1] pgVector File Retriever")
-            try:
-                from app.services import EmbeddingService
-                import asyncio
-                
-                embedding_service = EmbeddingService()
-                
-                # Create sync wrapper for async embed method
-                def embed_sync(text: str):
-                    """Synchronous wrapper for async embedding."""
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        # If we're in an async context, create a wrapper that returns a placeholder
-                        # In production, use asyncio.run() in a thread pool
-                        return [0.0] * 384  # Placeholder
-                    return loop.run_until_complete(embedding_service.embed(text))
-                
-                vector_config = VectorSearchConfig(
-                    similarity_threshold=0.5,
-                    top_k=5,
-                    search_timeout_ms=5000,
-                )
-                file_retriever = PgVectorFileRetriever(SessionLocal, embed_sync, vector_config)
-                # Note: setup_index() should be called separately or during migrations
-                app.state.file_retriever = file_retriever
-            except Exception as e:
-                print(f"    [WARN] pgVector setup skipped (optional): {e}")
-                app.state.file_retriever = None
-            
-            # P2: Conversation memory manager
-            print("    [P2] Conversation Memory Manager")
-            def token_counter(text):
-                """Simple token counter: ~1 token per 4 characters"""
-                return max(1, len(text) // 4)
-            
-            memory_config = ConversationMemoryConfig(
-                max_context_tokens=6000,
-                summary_trigger_ratio=0.8,
-                token_counter_fn=token_counter,
-                keep_recent_messages=5,
-                keep_messages_hours=24,
-            )
-            memory_manager = ConversationMemoryManager(memory_config)
-            app.state.memory_manager = memory_manager
-            
-            # P2: Privacy & Audit layer
-            print("    [P2] Privacy & Audit Layer")
-            privacy_config = PrivacyConfig(
-                redact_pii_in_logs=True,
-                retention_days_default=90,
-                retention_days_audit_log=365,
-            )
-            pii_detector = PiiDetector(privacy_config)
-            audit_logger = AuditLogger(SessionLocal, pii_detector, privacy_config)
-            app.state.pii_detector = pii_detector
-            app.state.audit_logger = audit_logger
-            
-            # P3: Evaluation harness
-            print("    [P3] Routing Evaluation Harness")
-            evaluator = RoutingEvaluationHarness(router)
-            from app.services import ALL_TEST_CASES
-            evaluator.register_test_cases(ALL_TEST_CASES)
-            app.state.evaluator = evaluator
-            
-            print("    [OK] All P0-P3 services initialized")
-            
-            print("\n" + "=" * 70)
-            print("[OK] SERVICE INITIALIZATION COMPLETE")
-            print("=" * 70)
-            print("\nInitialized Services:")
-            print("  [P0] Unified Semantic Router (4-layer routing)")
-            print("  [P1] SQL Safety Validator (config-driven)")
-            print("  [P1] pgVector File Retriever (indexed search)")
-            print("  [P2] Conversation Memory Manager (rolling summarization)")
-            print("  [P2] Privacy & Audit Layer (PII detection + logging)")
-            print("  [P3] Routing Evaluation Harness (16 built-in tests)")
-            print("\n" + "=" * 70 + "\n")
-            
-        except Exception as e:
-            print(f"\n[ERROR] Initialization error: {e}")
-            import traceback
-            traceback.print_exc()
-            raise  # Re-raise so we know initialization failed
-
-    @app.on_event("shutdown")
-    async def shutdown_event():
-        # Best-effort cleanup. Shielded inside dispose_engine().
-        try:
-            await dispose_engine()
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"[SHUTDOWN] Engine dispose failed: {e}")
-
-    # Include the dynamic API router
     app.include_router(api_router, prefix="/api/dynamic")
-
     return app
 
 
@@ -258,9 +330,13 @@ if __name__ == "__main__":
     # the Uvicorn development server. In production one might instead use
     # ``uvicorn main:app --host 0.0.0.0 --port 5000`` or a
     # process manager such as Gunicorn.
+    # PERFORMANCE FIX: Disable reload and use single worker to prevent multiple initializations
+    import os
+    port = int(os.getenv("PORT", settings.port))
     uvicorn.run(
         "main:app",
         host=settings.host,
-        port=settings.port,
-        reload=settings.debug,
+        port=port,
+        reload=False,  # Disable auto-reload to prevent multiple initializations
+        workers=1,     # Single worker mode
     )

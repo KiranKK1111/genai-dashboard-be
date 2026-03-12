@@ -69,12 +69,36 @@ def build_database_url() -> str:
 
 DATABASE_URL = build_database_url()
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=settings.debug,
-    future=True,
-    pool_pre_ping=True,  # Verify connections before using
-)
+
+def _build_engine_kwargs() -> dict:
+    """Build dialect-specific engine kwargs with configured pool settings."""
+    db_type = settings.db_type.lower()
+    base: dict = {"echo": settings.debug, "future": True}
+
+    if db_type == "sqlite":
+        # SQLite uses StaticPool — pooling arguments are not valid
+        from sqlalchemy.pool import StaticPool
+        base["connect_args"] = {"check_same_thread": False}
+        base["poolclass"] = StaticPool
+    elif db_type == "sqlserver":
+        # pyodbc connections cannot be safely shared across threads; use NullPool
+        from sqlalchemy.pool import NullPool
+        base["poolclass"] = NullPool
+    else:
+        # PostgreSQL, MySQL, MariaDB — full connection pool
+        base.update(
+            {
+                "pool_size": settings.db_pool_size,
+                "max_overflow": settings.db_max_overflow,
+                "pool_timeout": settings.db_pool_timeout,
+                "pool_recycle": settings.db_pool_recycle,
+                "pool_pre_ping": settings.db_pool_pre_ping,
+            }
+        )
+    return base
+
+
+engine = create_async_engine(DATABASE_URL, **_build_engine_kwargs())
 
 
 # Lazy-load dialect adapter to avoid circular imports

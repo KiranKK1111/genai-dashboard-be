@@ -10,6 +10,7 @@ Takes raw extraction/query results and transforms them into:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import logging
@@ -17,6 +18,10 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 import textwrap
+
+# Timeouts for LLM calls (parallel execution means these don't stack)
+_LLM_TIMEOUT_SECONDS = 20        # General narrative timeout
+_FOLLOWUP_TIMEOUT_SECONDS = 15   # Follow-ups are lower priority
 
 from app.services.dynamic_visualization_generator import DynamicVisualizationGenerator
 from .. import llm
@@ -228,83 +233,179 @@ class ResponseComposer:
         results: List[Dict[str, Any]],
         execution_time: float,
         intent: str = "run_sql",
+        skip_llm_calls: bool = False,
+        user_query: str = "",
     ) -> tuple[AssistantMessage, ArtifactsMetadata, List[FollowUp], Optional[Dict[str, Any]]]:
         """
         Compose a response for SQL query results with dynamic AI-powered visualizations.
-        
-        Uses LLM to generate intelligent visualization configurations based on the data.
-        
+
         Args:
-            query: The SQL query that was executed
-            results: Result rows
+            query:          The SQL query that was executed
+            results:        Result rows
             execution_time: Query execution time in seconds
-            intent: What the user was trying to do
-            
+            intent:         What the user was trying to do
+            skip_llm_calls: Skip LLM for simple queries (performance)
+            user_query:     Original natural-language question (used for narrative + follow-ups)
+
         Returns:
-            Tuple of (assistant_message, artifacts, followups, visualization_dict_with_schema_and_aggregators)
+            Tuple of (assistant_message, artifacts, followups, visualizations)
         """
-        # Generate natural intro (no hardcoded emojis)
         row_count = len(results)
-        title = f"Query Results ({row_count} rows)"
-        
-        blocks = []
-        
-        # Intro paragraph (clean professional response)
-        if row_count > 0:
-            blocks.append(ContentBlock(
-                type=ContentBlockType.PARAGRAPH,
-                text=f"I found {row_count} rows matching your query (took {execution_time:.2f}s)."
-            ))
+
+        # ── 1-5. Run LLM-powered steps concurrently for performance ──────────
+        title = ResponseComposer._build_title(user_query, row_count)
+
+        if user_query and not skip_llm_calls:
+            # Run narrative, visualizations, and follow-ups in parallel
+            narrative, visualizations, followups = await asyncio.gather(
+                ResponseComposer._generate_narrative_async(
+                    user_query=user_query, sql=query, results=results
+                ),
+                ResponseComposer._generate_visualizations_async(results, query, row_count),
+                ResponseComposer.generate_dynamic_sql_followups(
+                    results=results, user_query=user_query, sql_query=query
+                ),
+            )
         else:
-            blocks.append(ContentBlock(
-                type=ContentBlockType.PARAGRAPH,
-                text="Your query returned no results."
-            ))
-        
-        # Show first few rows as table if data exists
-        if results and len(results) > 0:
-            first_row = results[0]
-            headers = list(first_row.keys())
-            rows = []
-            
-            # Take first 10 rows for display
-            for row in results[:10]:
-                rows.append([str(row.get(h, "")) for h in headers])
-            
+            narrative = ResponseComposer._fallback_narrative(row_count, results)
+            visualizations = ResponseComposer._generate_visualizations(results, query, row_count)
+            followups = ResponseComposer._generate_sql_followups(row_count, intent, results, query)
+
+        # Always ensure a table visualization is present in the viz payload
+        visualizations = ResponseComposer._ensure_table_visualization(visualizations, results)
+
+        # ── Content blocks ─────────────────────────────────────────────────────
+        blocks: List[ContentBlock] = []
+        blocks.append(ContentBlock(type=ContentBlockType.PARAGRAPH, text=narrative))
+
+        if results:
+            headers = list(results[0].keys())
+            display_rows = [
+                [str(row.get(h, "")) for h in headers]
+                for row in results[:50]
+            ]
             blocks.append(ContentBlock(
                 type=ContentBlockType.TABLE,
                 headers=headers,
-                rows=rows
+                rows=display_rows,
             ))
-            
-            if len(results) > 10:
+            if row_count > 50:
                 blocks.append(ContentBlock(
                     type=ContentBlockType.CALLOUT,
                     variant="info",
-                    text=f"Showing first 10 of {len(results)} rows. Use filtering or export for the full result set."
+                    text=f"Showing 50 of {row_count:,} rows. Ask me to filter, sort, or export for the full set.",
                 ))
-        
-        # Suggest next actions (no hardcoded emojis)
-        blocks.append(ContentBlock(
-            type=ContentBlockType.CALLOUT,
-            variant="next",
-            text="Would you like to create a visualization, export results to CSV, or refine the query?"
-        ))
-        
-        assistant = AssistantMessage(
-            title=title,
-            content=blocks
-        )
-        
+
+        assistant = AssistantMessage(title=title, content=blocks)
         artifacts = ArtifactsMetadata(sql=query)
-        
-        # Generate DYNAMIC visualizations with AI-powered schema and aggregators
-        visualizations = await ResponseComposer._generate_visualizations_async(results, query, row_count)
-        
-        # Generate context-aware follow-ups
-        followups = ResponseComposer._generate_sql_followups(row_count, intent, results, query)
-        
+
         return assistant, artifacts, followups, visualizations
+
+    # ── Narrative helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    async def _generate_narrative_async(
+        user_query: str,
+        sql: str,
+        results: List[Dict[str, Any]],
+    ) -> str:
+        """Generate a ChatGPT-style analytical narrative for query results."""
+        row_count = len(results)
+        # Build a compact data summary for the LLM
+        if row_count == 0:
+            data_summary = "The query returned no rows."
+        elif row_count == 1:
+            data_summary = f"Result: {dict(list(results[0].items())[:8])}"
+        else:
+            cols = list(results[0].keys())
+            sample = [dict(list(r.items())[:6]) for r in results[:3]]
+            data_summary = (
+                f"{row_count} rows, columns: {', '.join(cols[:10])}\n"
+                f"First 3 rows: {sample}"
+            )
+
+        prompt = (
+            f"A user asked: \"{user_query}\"\n"
+            f"SQL executed: {sql}\n"
+            f"Data: {data_summary}\n\n"
+            "Write a clear, direct 1-3 sentence answer to the user's question based on this data. "
+            "Be specific — mention key numbers, trends, or findings. "
+            "Use **bold** for important numbers or values. "
+            "Do NOT say 'I found X rows' or repeat the SQL. Just answer the question naturally."
+        )
+        try:
+            response = await asyncio.wait_for(
+                llm.call_llm(
+                    [
+                        {"role": "system", "content": (
+                            "You are a data analyst. Answer questions about query results "
+                            "concisely and clearly, like ChatGPT would. Respond in plain text "
+                            "with markdown bold (**value**) for key numbers only."
+                        )},
+                        {"role": "user", "content": prompt},
+                    ],
+                    stream=False,
+                    max_tokens=150,
+                    temperature=0.2,
+                ),
+                timeout=_LLM_TIMEOUT_SECONDS,
+            )
+            narrative = str(response).strip()
+            if narrative:
+                return narrative
+        except Exception as e:
+            logger.debug("[RESPONSE_COMPOSER] Narrative generation failed: %s", e)
+        return ResponseComposer._fallback_narrative(row_count, results)
+
+    @staticmethod
+    def _fallback_narrative(row_count: int, results: List[Dict[str, Any]]) -> str:
+        """Simple fallback narrative when LLM is unavailable."""
+        if row_count == 0:
+            return "No results were found for your query."
+        if row_count == 1 and results:
+            # For single-row results (COUNT, SUM, etc.) show the value directly
+            row = results[0]
+            pairs = ", ".join(f"**{k}**: {v}" for k, v in list(row.items())[:4])
+            return f"Here is the result: {pairs}."
+        return f"Found **{row_count:,}** records matching your query."
+
+    @staticmethod
+    def _build_title(user_query: str, row_count: int) -> str:
+        """Build a meaningful title from the user's question."""
+        if not user_query:
+            return f"Query Results ({row_count:,} rows)"
+        # Capitalise first letter, strip trailing punctuation
+        title = user_query.strip().rstrip("?!.")
+        title = title[0].upper() + title[1:] if title else "Query Results"
+        return title
+
+    @staticmethod
+    def _ensure_table_visualization(
+        visualizations: Optional[Dict[str, Any]],
+        results: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Guarantee a table visualization is always present in the viz payload."""
+        if not results:
+            return visualizations
+
+        table_viz = {
+            "type": "table",
+            "columns": list(results[0].keys()),
+            "data": results[:500],          # cap rows for frontend safety
+            "row_count": len(results),
+            "is_default": True,
+        }
+
+        if visualizations is None:
+            return {"charts": [], "table": table_viz, "default": "table"}
+
+        if isinstance(visualizations, dict):
+            if "table" not in visualizations:
+                visualizations["table"] = table_viz
+            if "default" not in visualizations:
+                visualizations["default"] = "table"
+
+        return visualizations
     
     @staticmethod
     def compose_sql_response(
@@ -425,9 +526,10 @@ class ResponseComposer:
         )
         
         artifacts = ArtifactsMetadata()
-        
-        followups = await ResponseComposer._generate_chat_followups(user_query, intent, answer)
-        
+
+        # No follow-up suggestions for conversational chat (user preference)
+        followups: List[FollowUp] = []
+
         return assistant, artifacts, followups
     
     @staticmethod
@@ -564,7 +666,7 @@ class ResponseComposer:
             )
             return visualization
         except Exception as e:
-            print(f"WARNING: Dynamic visualization generation failed: {e}, using fallback")
+            logger.debug(f"WARNING: Dynamic visualization generation failed: {e}, using fallback")
             # Fallback to simple multi_viz if AI generation fails (no hardcoded emoji)
             return {
                 "chart_id": "v1",
@@ -663,29 +765,36 @@ Respond ONLY with JSON:
 {{"followups": ["question1", "question2", "question3"]}}"""
         
         try:
-            response = await llm.call_llm(
-                [{"role": "system", "content": "You generate context-aware follow-up questions. Respond ONLY with valid JSON."},
-                 {"role": "user", "content": prompt}],
-                stream=False,
-                max_tokens=200,
-                temperature=0.3
+            response = await asyncio.wait_for(
+                llm.call_llm(
+                    [{"role": "system", "content": "You generate context-aware follow-up questions. Respond ONLY with valid JSON."},
+                     {"role": "user", "content": prompt}],
+                    stream=False,
+                    max_tokens=200,
+                    temperature=0.3,
+                ),
+                timeout=_LLM_TIMEOUT_SECONDS,
             )
-            
+
             # Parse response
             response_str = str(response).strip().replace('```json', '').replace('```', '').strip()
             json_match = re.search(r'\{[^{}]*"followups"[^{}]*\}', response_str, re.DOTALL)
-            
+
             if json_match:
                 result = json.loads(json_match.group(0))
                 followup_texts = result.get('followups', [])[:3]
-                
+
                 return [
                     FollowUp(id=f"fu_{i+1}", text=text)
                     for i, text in enumerate(followup_texts) if text
                 ]
+        except asyncio.TimeoutError:
+            logger.warning("[RESPONSE_COMPOSER] File followup LLM call timed out after %ds", _LLM_TIMEOUT_SECONDS)
+        except json.JSONDecodeError as e:
+            logger.warning("[RESPONSE_COMPOSER] JSON parse error in file followup generation: %s", e)
         except Exception as e:
-            logger.warning(f"[RESPONSE_COMPOSER] Dynamic followup generation failed: {e}")
-        
+            logger.warning("[RESPONSE_COMPOSER] Dynamic file followup generation failed: %s", e)
+
         # Fallback to static followups
         return ResponseComposer._generate_file_followups(filename, intent)
     
@@ -739,28 +848,35 @@ Respond ONLY with JSON:
 {{"followups": ["question1", "question2", "question3"]}}"""
         
         try:
-            response = await llm.call_llm(
-                [{"role": "system", "content": "You generate context-aware follow-up questions for data queries. Respond ONLY with valid JSON."},
-                 {"role": "user", "content": prompt}],
-                stream=False,
-                max_tokens=200,
-                temperature=0.3
+            response = await asyncio.wait_for(
+                llm.call_llm(
+                    [{"role": "system", "content": "You generate context-aware follow-up questions for data queries. Respond ONLY with valid JSON."},
+                     {"role": "user", "content": prompt}],
+                    stream=False,
+                    max_tokens=200,
+                    temperature=0.3,
+                ),
+                timeout=_FOLLOWUP_TIMEOUT_SECONDS,
             )
-            
+
             response_str = str(response).strip().replace('```json', '').replace('```', '').strip()
             json_match = re.search(r'\{[^{}]*"followups"[^{}]*\}', response_str, re.DOTALL)
-            
+
             if json_match:
                 result = json.loads(json_match.group(0))
                 followup_texts = result.get('followups', [])[:3]
-                
+
                 return [
                     FollowUp(id=f"fu_{i+1}", text=text)
                     for i, text in enumerate(followup_texts) if text
                 ]
+        except asyncio.TimeoutError:
+            logger.warning("[RESPONSE_COMPOSER] SQL followup LLM call timed out after %ds", _FOLLOWUP_TIMEOUT_SECONDS)
+        except json.JSONDecodeError as e:
+            logger.warning("[RESPONSE_COMPOSER] JSON parse error in SQL followup generation: %s", e)
         except Exception as e:
-            logger.warning(f"[RESPONSE_COMPOSER] Dynamic SQL followup generation failed: {e}")
-        
+            logger.warning("[RESPONSE_COMPOSER] Dynamic SQL followup generation failed: %s", e)
+
         # Fallback to static
         return ResponseComposer._generate_sql_followups(row_count, "run_sql", results, sql_query)
     
@@ -902,7 +1018,7 @@ Requirements:
                     followups.append(FollowUp(id=f"fu_{i+1}", text=text))
                 return followups
         except Exception as e:
-            print(f"[FOLLOWUPS] Dynamic generation failed: {e}, using fallback")
+            logger.debug(f"[FOLLOWUPS] Dynamic generation failed: {e}, using fallback")
         
         # Fallback to generic questions if LLM fails
         return [
@@ -910,3 +1026,107 @@ Requirements:
             FollowUp(id="fu_2", text="Give me an example"),
             FollowUp(id="fu_3", text="How does this compare to...?"),
         ]
+
+
+# ============================================================================
+# Clarification Response Builder
+# ============================================================================
+
+def build_clarification_lama_response(
+    session_id: str,
+    user_query: str,
+    ambiguity_analysis: Any,  # AmbiguityAnalysis from clarification_engine
+    message_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Build a LamaResponse dict for a clarification request.
+
+    When the ClarificationEngine detects high ambiguity the route handler
+    should return this response rather than running the full pipeline.
+
+    The response:
+    - Has mode="clarification"
+    - Has routing.type="clarification"
+    - Has NO visualizations (user must answer before we query)
+    - Has NO followups (replaced by clarification block)
+    - Includes a structured `clarification` block listing all questions
+
+    Args:
+        session_id: Current session ID
+        user_query: The ambiguous user query
+        ambiguity_analysis: AmbiguityAnalysis object from ClarificationEngine
+        message_id: Optional pre-generated message UUID
+
+    Returns:
+        LamaResponse-compatible dict ready to return via ResponseWrapper
+    """
+    import time, uuid as _uuid
+
+    _message_id = message_id or f"msg_{_uuid.uuid4().hex[:12]}"
+
+    # Build human-friendly explanation
+    reasoning = getattr(ambiguity_analysis, "reasoning", "")
+    ambiguity_types = [
+        a.value if hasattr(a, "value") else str(a)
+        for a in getattr(ambiguity_analysis, "ambiguities", [])
+    ]
+
+    explanation = (
+        "I need a little more information before I can answer precisely. "
+        + (reasoning if reasoning else "The query could be interpreted in multiple ways.")
+    )
+
+    # Build the content blocks
+    content_blocks = [
+        {
+            "type": "paragraph",
+            "text": explanation,
+        }
+    ]
+
+    # Serialize each clarification request as a structured question
+    clarification_questions = []
+    for req in getattr(ambiguity_analysis, "clarifications_needed", []):
+        if hasattr(req, "to_dict"):
+            clarification_questions.append(req.to_dict())
+        elif isinstance(req, dict):
+            clarification_questions.append(req)
+        else:
+            clarification_questions.append({"question": str(req)})
+
+    return {
+        "id": _message_id,
+        "object": "chat.response",
+        "created_at": int(time.time() * 1000),
+        "session_id": session_id,
+        "mode": "clarification",
+        "assistant": {
+            "role": "assistant",
+            "title": "Could you clarify?",
+            "content": content_blocks,
+        },
+        "artifacts": {
+            "files_used": [],
+            "citations": [],
+            "sql": None,
+        },
+        "visualizations": None,
+        "routing": {
+            "type": "clarification",
+            "intent": user_query,
+            "confidence": float(getattr(ambiguity_analysis, "confidence", 0.5)),
+        },
+        "followups": [],
+        "suggested_questions": [],
+        "suggested_actions": [],
+        "clarification": {
+            "ambiguity_types": ambiguity_types,
+            "questions": clarification_questions,
+            "reasoning": reasoning,
+            "can_proceed": bool(getattr(ambiguity_analysis, "can_proceed", True)),
+        },
+        "debug": {
+            "clarification_triggered": True,
+            "ambiguity_types": ambiguity_types,
+        },
+    }

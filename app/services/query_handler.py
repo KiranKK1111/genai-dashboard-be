@@ -16,8 +16,7 @@ from ..helpers import current_timestamp, make_json_serializable
 from .file_handler import add_file, retrieve_relevant_chunks
 from .query_executor import run_sql, apply_smart_limit
 from .response_formatter import should_return_as_message, determine_visualization_type
-from .sql_generator import generate_sql, generate_sql_with_analysis
-from .followup_manager import get_followup_analyzer
+from .followup_manager import get_followup_analyzer  # Used for followup detection only
 from .database_adapter import get_global_adapter, DatabaseType
 
 # NEW: Import semantic query orchestrator for plan-first generation
@@ -42,7 +41,12 @@ from .result_interpreter import get_result_interpreter
 from .auto_retry_logic import get_auto_retry_executor, ErrorCategory
 
 # Progress tracking
-from .progress_tracker import progress_tracker_manager, ProgressStep
+from .progress_tracker import (
+    progress_tracker_manager, ProgressStep,
+    PLAN_SQL, PLAN_FILE_STRUCTURED, PLAN_FILE_UNSTRUCTURED,
+    PLAN_FILE_LOOKUP_STRUCTURED, PLAN_FILE_LOOKUP_UNSTRUCTURED,
+    PLAN_VARIATIONS,
+)
 
 # Module-level instances (lazy-initialized on first use)
 _semantic_orchestrator: Optional[SemanticQueryOrchestrator] = None
@@ -60,7 +64,7 @@ async def _get_semantic_orchestrator(db: AsyncSession) -> SemanticQueryOrchestra
     global _semantic_orchestrator
     if _semantic_orchestrator is None:
         _semantic_orchestrator = SemanticQueryOrchestrator(db_session=db)
-        print("[INIT] Semantic Query Orchestrator initialized (lazy)")
+        logger.debug("[INIT] Semantic Query Orchestrator initialized (lazy)")
     return _semantic_orchestrator
 
 
@@ -160,7 +164,7 @@ def add_schema_prefixes_to_sql(sql: str, schema_name: str = None) -> str:
     
     result = re.sub(variant_join_pattern, replace_variant_join, result, flags=re.IGNORECASE | re.MULTILINE)
     
-    print(f"[SCHEMA_PREFIX] SQL after adding schema prefixes:\n  Before: {sql[:120]}...\n  After:  {result[:120]}...")
+    logger.debug(f"[SCHEMA_PREFIX] SQL after adding schema prefixes:\n  Before: {sql}\n  After:  {result}")
     
     return result
 
@@ -349,7 +353,7 @@ def normalize_sql_semantics(sql: str, user_query: str) -> str:
     # Don't try to inject JOINs - let LLM or user handle this based on actual schema
     
     if result != sql:
-        print(f"[NORMALIZE] SQL semantics adjusted (DATABASE-AGNOSTIC - {adapter.db_type.value.upper()}):\n  "
+        logger.debug(f"[NORMALIZE] SQL semantics adjusted (DATABASE-AGNOSTIC - {adapter.db_type.value.upper()}):\n  "
               f"Before: {sql[:120]}\n  After: {result[:120]}")
     
     return result
@@ -597,7 +601,7 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
     table_match = re.search(r'(?:FROM|JOIN)\s+(?:ONLY\s+)?(?:\w+\.)?(\w+)\s+(?:\w+)?(?:\s|$|WHERE|JOIN|,)', sql, re.IGNORECASE)
     if table_match:
         target_table = table_match.group(1).lower()
-        print(f"[DYNAMIC_MAP] Target table: {target_table}")
+        logger.debug(f"[DYNAMIC_MAP] Target table: {target_table}")
     
     # DYNAMIC: Extract ALL column names from schema context (not hardcoded)
     schema_cols = []
@@ -657,9 +661,9 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
                 # Use only columns from this specific table
                 original_count = len(schema_cols_set)
                 schema_cols_set = table_specific_set
-                print(f"[DYNAMIC_MAP] TABLE-AWARE: Filtered {original_count} → {len(schema_cols_set)} columns for table '{target_table}'")
+                logger.debug(f"[DYNAMIC_MAP] TABLE-AWARE: Filtered {original_count} → {len(schema_cols_set)} columns for table '{target_table}'")
     
-    print(f"[DYNAMIC_MAP] Extracted {len(schema_cols_set)} columns from schema: {list(schema_cols_set)[:5]}...")
+    logger.debug(f"[DYNAMIC_MAP] Extracted {len(schema_cols_set)} columns from schema: {list(schema_cols_set)}")
     
     # DYNAMIC: Extract all column references from the SQL (both wrong and correct)
     # These are the column names being used in WHERE/SELECT/JOIN clauses
@@ -667,17 +671,17 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
     sql_cols += re.findall(r'(?:SELECT|WHERE|AND|OR)\s+([a-z_]\w*)\s*(?:FROM|WHERE|,)', sql, re.IGNORECASE)
     sql_cols_set = set(col.lower() for col in sql_cols if col and len(col) > 1)
     
-    print(f"[DYNAMIC_MAP] Extracted {len(sql_cols_set)} columns from SQL: {list(sql_cols_set)[:5]}...")
+    logger.debug(f"[DYNAMIC_MAP] Extracted {len(sql_cols_set)} columns from SQL: {list(sql_cols_set)}")
     
     # DYNAMIC: Find columns in SQL that DON'T exist in schema (likely wrong names)
     wrong_cols = sql_cols_set - schema_cols_set
-    print(f"[DYNAMIC_MAP] Detected potential wrong columns: {wrong_cols}")
+    logger.debug(f"[DYNAMIC_MAP] Detected potential wrong columns: {wrong_cols}")
     
     # CROSS-TABLE PREDICATE RELOCATION: Check if wrong columns exist in joinable tables
     # This handles cases where filter predicates belong to a different table
     # Example: main_table.some_flag doesn't exist, but related_table.some_flag does
     if wrong_cols and target_table:
-        print(f"[DYNAMIC_MAP] Attempting cross-table predicate relocation...")
+        logger.debug(f"[DYNAMIC_MAP] Attempting cross-table predicate relocation...")
         all_tables = extract_tables_and_columns(schema_context)
         
         # First, ensure the main table has an alias
@@ -694,7 +698,7 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
             # Check if it's a SQL keyword
             if potential_alias.upper() not in sql_keywords:
                 main_table_alias = potential_alias
-                print(f"[DYNAMIC_MAP] Main table already has alias: {main_table_alias}")
+                logger.debug(f"[DYNAMIC_MAP] Main table already has alias: {main_table_alias}")
         
         if not main_table_alias:
             # Add alias to main table
@@ -720,7 +724,7 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
                 result,
                 flags=re.IGNORECASE
             )
-            print(f"[DYNAMIC_MAP] Main table aliased: {target_table} → {main_table_alias}")
+            logger.debug(f"[DYNAMIC_MAP] Main table aliased: {target_table} → {main_table_alias}")
         
         for wrong_col in list(wrong_cols):
             # Check if this column exists in other joinable tables
@@ -729,9 +733,9 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
             )
             
             if found_table and found_col:
-                print(f"[DYNAMIC_MAP] RELOCATION: '{wrong_col}' not in {target_table}")
-                print(f"[DYNAMIC_MAP]   Found in {found_table}: '{found_col}'")
-                print(f"[DYNAMIC_MAP]   Adding JOIN: {join_condition}")
+                logger.debug(f"[DYNAMIC_MAP] RELOCATION: '{wrong_col}' not in {target_table}")
+                logger.debug(f"[DYNAMIC_MAP]   Found in {found_table}: '{found_col}'")
+                logger.debug(f"[DYNAMIC_MAP]   Adding JOIN: {join_condition}")
                 
                 # Create table alias for the other table (random unique alias, not hardcoded first letter)
                 import random, string
@@ -778,7 +782,7 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
                         
                         join_clause = f" JOIN {found_table} {joined_table_alias} ON {join_cond_with_aliases}"
                         result = result[:insert_pos] + join_clause + result[insert_pos:]
-                        print(f"[DYNAMIC_MAP] SQL after relocation: {result[:150]}...")
+                        logger.debug(f"[DYNAMIC_MAP] SQL after relocation: {result}")
                 
                 # Remove from wrong_cols set since we handled it
                 wrong_cols.discard(wrong_col)
@@ -788,7 +792,7 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
     
     # If wrong columns remain, try semantic matching
     if wrong_cols:
-        print(f"[DYNAMIC_MAP] Attempting semantic matching for remaining columns...")
+        logger.debug(f"[DYNAMIC_MAP] Attempting semantic matching for remaining columns...")
         
         def lcs_length(s1: str, s2: str) -> int:
             """Calculate Longest Common Subsequence length between two strings."""
@@ -972,18 +976,18 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
             # Only map if confidence threshold is met AND has strong signal
             if best_match and best_score >= confidence_threshold and has_strong_signal:
                 semantic_to_actual[wrong_col] = best_match
-                print(f"[DYNAMIC_MAP] Mapping '{wrong_col}' → '{best_match}' (score: {best_score:.2f})")
+                logger.debug(f"[DYNAMIC_MAP] Mapping '{wrong_col}' → '{best_match}' (score: {best_score:.2f})")
                 if len(all_candidates) > 1:
                     alts = ', '.join(f"{col}({score:.2f})" for col, score in all_candidates[1:3])
-                    print(f"[DYNAMIC_MAP]   Alternatives: {alts}")
+                    logger.debug(f"[DYNAMIC_MAP]   Alternatives: {alts}")
             else:
                 reason = ""
                 if best_match and not has_strong_signal:
                     reason = " (weak signal - no substring/token overlap/prefix match)"
-                print(f"[DYNAMIC_MAP] No good match for '{wrong_col}' (best: {best_match or 'none'}, score: {best_score:.2f}){reason}")
+                logger.debug(f"[DYNAMIC_MAP] No good match for '{wrong_col}' (best: {best_match or 'none'}, score: {best_score:.2f}){reason}")
                 if all_candidates:
                     tops = ', '.join(f"{col}({score:.2f})" for col, score in all_candidates[:3])
-                    print(f"[DYNAMIC_MAP]   Top candidates: {tops}")
+                    logger.debug(f"[DYNAMIC_MAP]   Top candidates: {tops}")
         
         # DYNAMIC: Apply all semantic mappings to SQL
         for wrong_col, correct_col in semantic_to_actual.items():
@@ -999,12 +1003,12 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
                 )
     
     if result != sql:
-        print(f"[DYNAMIC_MAP] SQL corrected:\n  Before: {sql[:100]}...\n  After: {result[:100]}...")
+        logger.debug(f"[DYNAMIC_MAP] SQL corrected:\n  Before: {sql}\n  After: {result}")
     
     # FINAL STEP: NORMALIZE BOOLEAN VALUES for the target database
     # Convert Python True/False to database-appropriate literals
     # E.g., False → false (PostgreSQL), True → true (PostgreSQL)
-    print(f"[TYPE_NORMALIZATION] Normalizing boolean values for database compatibility...")
+    logger.debug(f"[TYPE_NORMALIZATION] Normalizing boolean values for database compatibility...")
     
     try:
         adapter = get_global_adapter()
@@ -1018,9 +1022,9 @@ def map_semantic_columns(sql: str, schema_context: str, user_query: str) -> str:
         result = re.sub(r'\bFALSE\b', bool_false, result)
         
         if bool_true != "true" or bool_false != "false":
-            print(f"[TYPE_NORMALIZATION] Converted True/False to {bool_true}/{bool_false} for {adapter.db_type.value}")
+            logger.debug(f"[TYPE_NORMALIZATION] Converted True/False to {bool_true}/{bool_false} for {adapter.db_type.value}")
     except Exception as e:
-        print(f"[TYPE_NORMALIZATION] Warning: Could not normalize boolean values: {e}")
+        logger.debug(f"[TYPE_NORMALIZATION] Warning: Could not normalize boolean values: {e}")
     
     return result
 
@@ -1126,12 +1130,12 @@ def clean_invalid_where_clauses(sql: str, schema_context: str, user_query: str) 
     
     # DEFENSIVE: Check if WHERE clause already looks malformed
     if not is_valid_where_syntax(where_clause):
-        print(f"[WHERE_VALIDATION] Original WHERE clause already malformed: '{where_clause}', attempting removal")
+        logger.debug(f"[WHERE_VALIDATION] Original WHERE clause already malformed: '{where_clause}', attempting removal")
         # Try to remove the WHERE clause entirely
         sql = re.sub(r'\s+WHERE\s+.*?(?=\s*(?:\bLIMIT\b|\bORDER\b|\bGROUP\b|$))', ' ', sql, flags=re.IGNORECASE | re.DOTALL)
         return sql.strip()
     
-    print(f"[WHERE_VALIDATION] Analyzing WHERE clause: {where_clause[:100]}...")
+    logger.debug(f"[WHERE_VALIDATION] Analyzing WHERE clause: {where_clause}")
     
     # Extract all column references in WHERE clause (look for pattern: word = ... or word IN ... or word LIKE ...)
     where_cols = set()
@@ -1148,8 +1152,8 @@ def clean_invalid_where_clauses(sql: str, schema_context: str, user_query: str) 
     invalid_cols = where_cols - schema_cols
     
     if invalid_cols:
-        print(f"[WHERE_VALIDATION] Found invalid columns in WHERE: {invalid_cols}")
-        print(f"[WHERE_VALIDATION] Schema has: {list(schema_cols)[:10]}...")
+        logger.debug(f"[WHERE_VALIDATION] Found invalid columns in WHERE: {invalid_cols}")
+        logger.debug(f"[WHERE_VALIDATION] Schema has: {list(schema_cols)}")
         
         # For each invalid column, try to remove its condition from WHERE
         # Pattern: "invalid_col = value AND/OR" or standalone
@@ -1176,33 +1180,33 @@ def clean_invalid_where_clauses(sql: str, schema_context: str, user_query: str) 
                 if new_where != where_clause:
                     # Validate new WHERE syntax
                     if not is_valid_where_syntax(new_where):
-                        print(f"[WHERE_VALIDATION] Skipping removal of '{invalid_col}' - would create malformed WHERE: '{new_where}'")
+                        logger.debug(f"[WHERE_VALIDATION] Skipping removal of '{invalid_col}' - would create malformed WHERE: '{new_where}'")
                         continue
                     
                     where_clause = new_where
-                    print(f"[WHERE_VALIDATION] Removed invalid column '{invalid_col}' from WHERE")
+                    logger.debug(f"[WHERE_VALIDATION] Removed invalid column '{invalid_col}' from WHERE")
                     
                     if not where_clause:
                         # All conditions removed, remove entire WHERE clause
                         sql = re.sub(r'\s+WHERE\s+.*?(?=\s*(?:\bLIMIT\b|\bORDER\b|\bGROUP\b|$))', ' ', sql, flags=re.IGNORECASE | re.DOTALL)
-                        print(f"[WHERE_VALIDATION] WHERE clause empty, removing entirely")
+                        logger.debug(f"[WHERE_VALIDATION] WHERE clause empty, removing entirely")
                         return sql.strip()
         
         # DEFENSIVE: Validate final result before returning
         if where_clause and where_clause != where_match.group(1).strip():
             if not is_valid_where_syntax(where_clause):
-                print(f"[WHERE_VALIDATION] Final WHERE clause validity check failed, reverting to original SQL")
+                logger.debug(f"[WHERE_VALIDATION] Final WHERE clause validity check failed, reverting to original SQL")
                 return original_sql
             
             # Reconstruct SQL with cleaned WHERE clause
             sql = sql[:where_match.start(1)] + where_clause + sql[where_match.end(1):]
-            print(f"[WHERE_VALIDATION] SQL cleaned: {sql[:120]}...")
+            logger.debug(f"[WHERE_VALIDATION] SQL cleaned: {sql}")
         else:
-            print(f"[WHERE_VALIDATION] All WHERE columns are valid: {where_cols}")
+            logger.debug(f"[WHERE_VALIDATION] All WHERE columns are valid: {where_cols}")
     
     # Final sanity check - ensure no malformed WHERE remains in output
     if re.search(r'\bWHERE\s+[a-z]\.\s*(?:\bLIMIT\b|\bORDER\b|$)', sql, re.IGNORECASE):
-        print(f"[WHERE_VALIDATION] SANITY CHECK FAILED: Malformed WHERE detected in output, reverting")
+        logger.debug(f"[WHERE_VALIDATION] SANITY CHECK FAILED: Malformed WHERE detected in output, reverting")
         return original_sql
     
     return sql
@@ -1485,12 +1489,9 @@ async def build_data_query_response(
     # Get progress tracker if message_id is provided
     tracker = progress_tracker_manager.get_tracker(message_id) if message_id else None
     
-    # Truncate query for display (max 50 chars)
-    query_preview = query[:50] + "..." if len(query) > 50 else query
-    
     if tracker:
-        tracker.update(ProgressStep.VALIDATING, f"Validating: '{query_preview}'")
-        print(f"\n🔄 [PROGRESS] Validating: '{query_preview}'")
+        tracker.set_plan(PLAN_SQL)
+        tracker.update("routing", f"Received: '{query}'")
     
     # Initialize schema_info early so it's always available
     from ..helpers import get_database_schema
@@ -1499,79 +1500,85 @@ async def build_data_query_response(
         # Count tables in schema for dynamic message
         schema_table_count = schema_info.count("CREATE TABLE") if schema_info else 0
         if tracker:
-            tracker.update(ProgressStep.DISCOVERING_SCHEMA, f"Schema loaded: {schema_table_count} tables discovered")
-            print(f"🔄 [PROGRESS] Schema loaded: {schema_table_count} tables discovered")
+            tracker.done("schema_discovery", f"Schema loaded: {schema_table_count} tables")
     except Exception as e:
-        print(f"⚠️  Warning: Could not retrieve schema: {e}")
+        logger.debug(f"⚠️  Warning: Could not retrieve schema: {e}")
         schema_info = "Available tables detected from database. Use schema analysis to identify tables, columns, and relationships."
     
     # Try intelligent SQL generation first
-    print(f"\n[ANALYSIS] Processing query: '{query}'")
+    logger.debug(f"\n[ANALYSIS] Processing query: '{query}'")
+    
+    # PERFORMANCE FIX: Use arbiter's decision for intent type, not just conversation presence
+    # If followup_context_from_rag is None, arbiter said NEW_QUERY → don't say "follow-up"
+    if followup_context_from_rag:
+        intent_type = "follow-up"
+    else:
+        intent_type = "standalone query" if not conversation_history else "new query"
     
     if tracker:
-        intent_type = "follow-up" if conversation_history else "new query"
-        tracker.update(ProgressStep.ANALYZING_INTENT, f"Analyzing intent ({intent_type})...")
-        print(f"🔄 [PROGRESS] Analyzing intent ({intent_type})...")
+        tracker.done("routing", f"Routing: {intent_type}")
     
-    # DYNAMIC FOLLOW-UP DETECTION: Analyze if this is a follow-up query
-    followup_analyzer = await get_followup_analyzer()
-    previous_sql_tuple = _extract_previous_sql_from_messages(conversation_history)
-    previous_sql = previous_sql_tuple[0] if previous_sql_tuple else None
-    previous_result_count = previous_sql_tuple[1] if previous_sql_tuple else 0
-    
-    # ENHANCED: Also check session_manager for more recent/reliable context from SQL conversation history
-    if not previous_sql and session_manager:
-        # Try to get SQL from recent conversation entries
-        sql_history = session_manager.get_sql_conversation_history(max_entries=3)
-        if sql_history:
-            # Extract the most recent SQL from the conversation history
-            lines = sql_history.split('\n')
-            for line in reversed(lines):
-                if line.startswith('SQL:'):
-                    # Extract SQL and result count from the line
-                    sql_part = line[4:].strip()  # Remove 'SQL: ' prefix
-                    if ' | Results:' in sql_part:
-                        sql_text, results_part = sql_part.split(' | Results:', 1)
-                        try:
-                            result_count_match = results_part.strip().split()[0]
-                            previous_result_count = int(result_count_match)
-                        except (ValueError, IndexError):
-                            previous_result_count = 0
-                        previous_sql = sql_text.strip()
-                    else:
-                        previous_sql = sql_part.strip()
-                        previous_result_count = 0
-                    
-                    if previous_sql and 'SELECT' in previous_sql.upper():
-                        print(f"[DEBUG] Found recent SQL from conversation history: {previous_sql[:80]}...")
-                        break
+    # PERFORMANCE FIX: Skip heavy follow-up analyzer if arbiter already said NEW_QUERY
+    # followup_context_from_rag is None when arbiter determined it's NOT a follow-up
+    # This prevents loading sentence transformers unnecessarily for standalone queries
+    if followup_context_from_rag:
+        logger.debug(f"[FOLLOWUP] Using arbiter-provided followup context (skip redundant analysis)")
+        # Arbiter already determined this is a follow-up and provided context
+        previous_sql = None
+        previous_result_count = 0
+        if followup_context_from_rag.previous_context:
+            previous_sql = followup_context_from_rag.previous_context.generated_sql
+            previous_result_count = followup_context_from_rag.previous_context.result_count or 0
+            logger.debug(f"[FOLLOWUP] Previous SQL: {previous_sql if previous_sql else 'N/A'}")
+    else:
+        logger.debug(f"[ANALYSIS] Arbiter determined this is NOT a follow-up → skipping follow-up analyzer (performance optimization)")
+        # Don't load heavy machinery for standalone queries
+        previous_sql = None
+        previous_result_count = 0
     
     # ChatGPT-Level: Build conversation history from SQL session (clean, no tool_calls dependency)
     enhanced_conversation_history = conversation_history
     simple_query_history = ""
     
-    # Use the SQL conversation history as the primary source (this replaces complex tool_calls logic)
-    if session_manager:
-        simple_query_history = session_manager.get_sql_conversation_history(max_entries=5)
-        print(f"[DEBUG] Built SQL conversation history: {simple_query_history}")
-    
-    # ChatGPT-Level: Use SQL conversation history for dynamic follow-up detection
-    sql_conversation_history = simple_query_history if simple_query_history else ""
-    print(f"[DEBUG] SQL conversation history: {sql_conversation_history}")
+    # PERFORMANCE FIX: Only build SQL conversation history if this is actually a follow-up
+    # For standalone queries, skip this work
+    # Check ONLY followup_context_from_rag (arbiter's decision), not conversation_history
+    if followup_context_from_rag:
+        # Use the SQL conversation history as the primary source (this replaces complex tool_calls logic)
+        if session_manager:
+            simple_query_history = session_manager.get_sql_conversation_history(max_entries=5)
+            logger.debug(f"[DEBUG] Built SQL conversation history: {simple_query_history}")
+        
+        # ChatGPT-Level: Use SQL conversation history for dynamic follow-up detection
+        sql_conversation_history = simple_query_history if simple_query_history else ""
+        logger.debug(f"[DEBUG] SQL conversation history: {sql_conversation_history}")
+    else:
+        logger.debug(f"[ANALYSIS] Standalone query → skipping conversation history build (performance optimization)")
+        sql_conversation_history = ""
     
     # Use SQL history if available, otherwise fallback
     followup_history = sql_conversation_history if sql_conversation_history else enhanced_conversation_history
     
-    print(f"[DEBUG] Previous SQL extracted: {previous_sql[:80] if previous_sql else 'NONE'}..." if previous_sql else "[DEBUG] Previous SQL: NOT FOUND")
-    print(f"[DEBUG] Followup history length: {len(followup_history) if followup_history else 0}")
-    print(f"[DEBUG] Followup history sample: {followup_history[:200] if followup_history else 'NONE'}...")
+    logger.debug(f"[DEBUG] Previous SQL extracted: {previous_sql if previous_sql else 'NONE'}" if previous_sql else "[DEBUG] Previous SQL: NOT FOUND")
+    logger.debug(f"[DEBUG] Followup history length: {len(followup_history) if followup_history else 0}")
+    logger.debug(f"[DEBUG] Followup history sample: {followup_history if followup_history else 'NONE'}")
     
-    followup_context = await followup_analyzer.analyze(
-        current_query=query,
-        conversation_history=followup_history,  # Use SQL conversation history for ChatGPT-level detection
-        previous_sql=previous_sql,
-        previous_result_count=previous_result_count,
-    )
+    # Initialize followup analyzer only if needed
+    if followup_context_from_rag:
+        # Arbiter already provided followup context, use it directly
+        followup_context = followup_context_from_rag
+        logger.debug(f"[FOLLOWUP] Using arbiter-provided context directly (skip analyzer)")
+    else:
+        # Arbiter said NEW_QUERY, create empty context without heavy analysis
+        from .followup_manager import FollowUpContext, FollowUpType
+        followup_context = FollowUpContext(
+            is_followup=False,
+            followup_type=FollowUpType.NEW,
+            confidence=0.0,
+            reasoning="Arbiter determined this is a standalone/new query",
+            previous_context=None,
+        )
+        logger.debug(f"[FOLLOWUP] Created empty context for standalone query (skip heavy analyzer)")
     
     # NEW: Advanced ChatGPT-Level Semantic Analysis & Query Rewriting
     # Multi-stage intelligence: context analysis → intent classification → smart rewriting
@@ -1579,159 +1586,165 @@ async def build_data_query_response(
     rewritten_query_plan = None
     advanced_context = None
     
-    try:
-        from .chatgpt_query_rewriter import get_chatgpt_query_rewriter
-        from .intelligent_conversation_manager import get_conversation_manager
-        
-        # Initialize advanced components
-        conversation_manager = get_conversation_manager()
-        semantic_rewriter = get_chatgpt_query_rewriter(db)
-        
-        # Get conversation context with intelligent memory management
-        conversation_context = conversation_manager.get_conversation_context(
-            session_id=session_id or "anonymous",
-            query=query,
-            include_full_history=False  # Use intelligent context selection
-        )
-        
-        print(f"[ADVANCED_SEMANTIC] 🧠 Context: {conversation_context['conversation_flow']} | "
-              f"Entities: {conversation_context.get('active_entities', [])} | "
-              f"Turns: {conversation_context.get('session_meta', {}).get('turn_count', 0)}")
-        
-        # Advanced semantic analysis and rewriting
-        if conversation_context.get("relevant_history") or session_manager:
+    # Skip advanced semantic analysis for standalone queries (performance optimization)
+    # Arbiter already made the routing decision - no need for expensive rewriting machinery
+    # Check ONLY followup_context_from_rag (arbiter's decision), not conversation_history
+    if followup_context_from_rag is None:
+        logger.debug(f"[ADVANCED_SEMANTIC] ⚡ Skipping semantic rewriter for standalone query (performance optimization)")
+    else:
+        try:
+            from .chatgpt_query_rewriter import get_chatgpt_query_rewriter
+            from .intelligent_conversation_manager import get_conversation_manager
             
-            # Prepare conversation history for semantic analysis
-            history_for_analysis = []
-            if session_manager:
-                # Use session manager's messages and tool calls for comprehensive history
-                try:
-                    # Get recent conversation messages
-                    recent_messages = session_manager.messages[-10:] if session_manager.messages else []
-                    
-                    # Get recent tool calls (SQL queries) for context
-                    recent_tool_calls = session_manager.tool_calls[-5:] if session_manager.tool_calls else []
-                    
-                    # Combine message history with tool execution context
-                    for msg in recent_messages:
-                        if msg.get('role') == 'user' and msg.get('content'):
-                            # Find corresponding tool call if exists
-                            corresponding_sql = None
-                            results_count = 0
-                            
-                            # Look for tool calls around the same time
+            # Initialize advanced components
+            conversation_manager = get_conversation_manager()
+            semantic_rewriter = get_chatgpt_query_rewriter(db)
+            
+            # Get conversation context with intelligent memory management
+            conversation_context = conversation_manager.get_conversation_context(
+                session_id=session_id or "anonymous",
+                query=query,
+                include_full_history=False  # Use intelligent context selection
+            )
+            
+            logger.debug(f"[ADVANCED_SEMANTIC] 🧠 Context: {conversation_context['conversation_flow']} | "
+                  f"Entities: {conversation_context.get('active_entities', [])} | "
+                  f"Turns: {conversation_context.get('session_meta', {}).get('turn_count', 0)}")
+            
+            # Advanced semantic analysis and rewriting
+            if conversation_context.get("relevant_history") or session_manager:
+                
+                # Prepare conversation history for semantic analysis
+                history_for_analysis = []
+                if session_manager:
+                    # Use session manager's messages and tool calls for comprehensive history
+                    try:
+                        # Get recent conversation messages
+                        recent_messages = session_manager.messages[-10:] if session_manager.messages else []
+                        
+                        # Get recent tool calls (SQL queries) for context
+                        recent_tool_calls = session_manager.tool_calls[-5:] if session_manager.tool_calls else []
+                        
+                        # Combine message history with tool execution context
+                        for msg in recent_messages:
+                            if msg.get('role') == 'user' and msg.get('content'):
+                                # Find corresponding tool call if exists
+                                corresponding_sql = None
+                                results_count = 0
+                                
+                                # Look for tool calls around the same time
+                                for tool_call in recent_tool_calls:
+                                    tool_user_query = None
+                                    tool_sql = None
+                                    tool_result_count = 0
+                                    
+                                    # Extract from input_json and output_json
+                                    if hasattr(tool_call, 'input_json') and tool_call.input_json:
+                                        tool_user_query = (tool_call.input_json.get('query') or 
+                                                          tool_call.input_json.get('user_query') or 
+                                                          tool_call.input_json.get('user_input'))
+                                    
+                                    if hasattr(tool_call, 'output_json') and tool_call.output_json:
+                                        tool_sql = (tool_call.output_json.get('generated_sql') or 
+                                                  tool_call.output_json.get('sql') or 
+                                                  tool_call.output_json.get('query'))
+                                        tool_result_count = tool_call.output_json.get('result_count', 0)
+                                    
+                                    if (tool_user_query and 
+                                        tool_user_query.strip().lower() in msg['content'].strip().lower()):
+                                        corresponding_sql = tool_sql
+                                        results_count = tool_result_count
+                                        break
+                                
+                                history_entry = {
+                                    "user_query": msg['content'],
+                                    "timestamp": msg.get('timestamp'),
+                                    "sql_query": corresponding_sql,
+                                    "results_count": results_count
+                                }
+                                history_for_analysis.append(history_entry)
+                        
+                        # If no messages but we have tool calls, use those
+                        if not history_for_analysis and recent_tool_calls:
                             for tool_call in recent_tool_calls:
-                                tool_user_query = None
-                                tool_sql = None
-                                tool_result_count = 0
+                                user_query = None
+                                generated_sql = None
+                                result_count = 0
                                 
                                 # Extract from input_json and output_json
                                 if hasattr(tool_call, 'input_json') and tool_call.input_json:
-                                    tool_user_query = (tool_call.input_json.get('query') or 
-                                                      tool_call.input_json.get('user_query') or 
-                                                      tool_call.input_json.get('user_input'))
+                                    user_query = (tool_call.input_json.get('query') or 
+                                                 tool_call.input_json.get('user_query') or 
+                                                 tool_call.input_json.get('user_input'))
                                 
                                 if hasattr(tool_call, 'output_json') and tool_call.output_json:
-                                    tool_sql = (tool_call.output_json.get('generated_sql') or 
-                                              tool_call.output_json.get('sql') or 
-                                              tool_call.output_json.get('query'))
-                                    tool_result_count = tool_call.output_json.get('result_count', 0)
+                                    generated_sql = (tool_call.output_json.get('generated_sql') or 
+                                                   tool_call.output_json.get('sql') or 
+                                                   tool_call.output_json.get('query'))
+                                    result_count = tool_call.output_json.get('result_count', 0)
                                 
-                                if (tool_user_query and 
-                                    tool_user_query.strip().lower() in msg['content'].strip().lower()):
-                                    corresponding_sql = tool_sql
-                                    results_count = tool_result_count
-                                    break
-                            
-                            history_entry = {
-                                "user_query": msg['content'],
-                                "timestamp": msg.get('timestamp'),
-                                "sql_query": corresponding_sql,
-                                "results_count": results_count
-                            }
-                            history_for_analysis.append(history_entry)
+                                if user_query:
+                                    history_entry = {
+                                        "user_query": user_query,
+                                        "timestamp": getattr(tool_call, 'start_time', None),
+                                        "sql_query": generated_sql,
+                                        "results_count": result_count
+                                    }
+                                    history_for_analysis.append(history_entry)
+                                    
+                    except Exception as e:
+                        logger.warning(f"Error extracting session history: {e}")
+                        history_for_analysis = []
+                else:
+                    # Use conversation manager's history
+                    history_for_analysis = conversation_context.get("relevant_history", [])
+                
+                # Run advanced semantic analysis and rewriting
+                rewrite_result = await semantic_rewriter.analyze_and_rewrite(
+                    query=query,
+                    conversation_history=history_for_analysis,
+                    session_id=session_id or "anonymous"
+                )
+                
+                advanced_context = rewrite_result.semantic_analysis
+                
+                # Apply rewriting if high confidence
+                if rewrite_result.confidence > 0.7 and rewrite_result.rewritten_query != query:
+                    logger.debug(f"[ADVANCED_SEMANTIC] 🎯 High confidence rewrite ({rewrite_result.confidence:.2f})")
+                    logger.debug(f"[ADVANCED_SEMANTIC] Intent: {advanced_context.intent_type.value}")
+                    logger.debug(f"[ADVANCED_SEMANTIC] Strategy: {rewrite_result.suggested_approach}")
+                    logger.debug(f"[ADVANCED_SEMANTIC] Reasoning: {' → '.join(rewrite_result.reasoning_chain[-2:])}")
                     
-                    # If no messages but we have tool calls, use those
-                    if not history_for_analysis and recent_tool_calls:
-                        for tool_call in recent_tool_calls:
-                            user_query = None
-                            generated_sql = None
-                            result_count = 0
-                            
-                            # Extract from input_json and output_json
-                            if hasattr(tool_call, 'input_json') and tool_call.input_json:
-                                user_query = (tool_call.input_json.get('query') or 
-                                             tool_call.input_json.get('user_query') or 
-                                             tool_call.input_json.get('user_input'))
-                            
-                            if hasattr(tool_call, 'output_json') and tool_call.output_json:
-                                generated_sql = (tool_call.output_json.get('generated_sql') or 
-                                               tool_call.output_json.get('sql') or 
-                                               tool_call.output_json.get('query'))
-                                result_count = tool_call.output_json.get('result_count', 0)
-                            
-                            if user_query:
-                                history_entry = {
-                                    "user_query": user_query,
-                                    "timestamp": getattr(tool_call, 'start_time', None),
-                                    "sql_query": generated_sql,
-                                    "results_count": result_count
-                                }
-                                history_for_analysis.append(history_entry)
-                                
-                except Exception as e:
-                    logger.warning(f"Error extracting session history: {e}")
-                    history_for_analysis = []
+                    original_query_to_analyze = rewrite_result.rewritten_query
+                    rewritten_query_plan = None  # Let the SQL generator handle the enhanced query
+                    
+                    logger.debug(f"[ADVANCED_SEMANTIC] ✅ Query enhanced: '{query}' → '{original_query_to_analyze}'")
+                    
+                elif rewrite_result.confidence > 0.5:
+                    logger.debug(f"[ADVANCED_SEMANTIC] ℹ️ Moderate confidence ({rewrite_result.confidence:.2f}) - using context hints")
+                    # Even if not rewriting completely, use enhanced context
+                    
+                else:
+                    logger.debug(f"[ADVANCED_SEMANTIC] ❓ Low confidence ({rewrite_result.confidence:.2f}) - treating as new query")
+            
             else:
-                # Use conversation manager's history
-                history_for_analysis = conversation_context.get("relevant_history", [])
-            
-            # Run advanced semantic analysis and rewriting
-            rewrite_result = await semantic_rewriter.analyze_and_rewrite(
-                query=query,
-                conversation_history=history_for_analysis,
-                session_id=session_id or "anonymous"
-            )
-            
-            advanced_context = rewrite_result.semantic_analysis
-            
-            # Apply rewriting if high confidence
-            if rewrite_result.confidence > 0.7 and rewrite_result.rewritten_query != query:
-                print(f"[ADVANCED_SEMANTIC] 🎯 High confidence rewrite ({rewrite_result.confidence:.2f})")
-                print(f"[ADVANCED_SEMANTIC] Intent: {advanced_context.intent_type.value}")
-                print(f"[ADVANCED_SEMANTIC] Strategy: {rewrite_result.suggested_approach}")
-                print(f"[ADVANCED_SEMANTIC] Reasoning: {' → '.join(rewrite_result.reasoning_chain[-2:])}")
+                logger.debug(f"[ADVANCED_SEMANTIC] 🔵 New conversation - no context available")
                 
-                original_query_to_analyze = rewrite_result.rewritten_query
-                rewritten_query_plan = None  # Let the SQL generator handle the enhanced query
-                
-                print(f"[ADVANCED_SEMANTIC] ✅ Query enhanced: '{query}' → '{original_query_to_analyze}'")
-                
-            elif rewrite_result.confidence > 0.5:
-                print(f"[ADVANCED_SEMANTIC] ℹ️ Moderate confidence ({rewrite_result.confidence:.2f}) - using context hints")
-                # Even if not rewriting completely, use enhanced context
-                
-            else:
-                print(f"[ADVANCED_SEMANTIC] ❓ Low confidence ({rewrite_result.confidence:.2f}) - treating as new query")
-        
-        else:
-            print(f"[ADVANCED_SEMANTIC] 🔵 New conversation - no context available")
-            
-    except Exception as e:
-        print(f"[ADVANCED_SEMANTIC] ⚠️ Advanced semantic analysis failed (non-critical): {e}")
-        logger.warning(f"Advanced semantic analysis failed: {e}")
-        # Continue with original query if advanced analysis fails
+        except Exception as e:
+            logger.debug(f"[ADVANCED_SEMANTIC] ⚠️ Advanced semantic analysis failed (non-critical): {e}")
+            logger.warning(f"Advanced semantic analysis failed: {e}")
+            # Continue with original query if advanced analysis fails
     
     if followup_context.is_followup:
-        print(f"[FOLLOWUP] Type: {followup_context.followup_type.value.upper()}, Confidence: {followup_context.confidence:.0%}")
-        print(f"[FOLLOWUP] Reasoning: {followup_context.reasoning}")
+        logger.debug(f"[FOLLOWUP] Type: {followup_context.followup_type.value.upper()}, Confidence: {followup_context.confidence:.0%}")
+        logger.debug(f"[FOLLOWUP] Reasoning: {followup_context.reasoning}")
         if followup_context.previous_context:
-            print(f"[FOLLOWUP] Previous table: {followup_context.previous_context.table_name}, Rows: {followup_context.previous_context.result_count}")
+            logger.debug(f"[FOLLOWUP] Previous table: {followup_context.previous_context.table_name}, Rows: {followup_context.previous_context.result_count}")
             if followup_context.previous_context.filters:
                 filters_str = ", ".join([f"{f['column']} {f['operator']} {f['value']}" for f in followup_context.previous_context.filters])
-                print(f"[FOLLOWUP] Previous filters: {filters_str}")
+                logger.debug(f"[FOLLOWUP] Previous filters: {filters_str}")
         else:
-            print(f"[FOLLOWUP] ⚠️  Context available: NO (previous_sql was not found)")
+            logger.debug(f"[FOLLOWUP] ⚠️  Context available: NO (previous_sql was not found)")
     
     # Check if this is a confirmation response to a previous clarifying question
     is_confirmation = any(word in query.lower() for word in ['yes', 'yeah', 'yep', 'correct', 'confirm', 'right', 'absolutely', 'true', 'sure'])
@@ -1742,7 +1755,7 @@ async def build_data_query_response(
     force_join = is_confirmation and has_previous_clarification
     
     if force_join:
-        print("[CONFIRMATION] User confirmed previous clarification; using conversation context")
+        logger.debug("[CONFIRMATION] User confirmed previous clarification; using conversation context")
         # When confirming a clarification, pass the full conversation so downstream
         # components can resolve the original intent/values without hardcoded assumptions.
         original_query_to_analyze = conversation_history
@@ -1761,19 +1774,50 @@ async def build_data_query_response(
         orchestrator_context.get('skipped_for_performance', False)
     )
     
+    # Holds the concept extraction result so the plan-first path can reuse it
+    # without making a second LLM call.
+    _cached_intent = None
+    _biz_tables = None  # business table names, fetched once and reused across all concept extractions
+    _biz_schemas = None  # {table: [columns]}, fetched once for concept extractor column awareness
+
     if skip_semantic_pipeline:
-        print(f"[SEMANTIC] ⚡ SKIPPING SEMANTIC PIPELINE (orchestration was skipped for performance)")  
-        print(f"[SEMANTIC] ✅ Fast path - using lightweight query processing")
+        # Quick pre-check: run LLM-based concept extraction once.
+        # Result is stored in _cached_intent and reused by the plan-first path.
+        try:
+            from .semantic_concept_extractor import get_concept_extractor as _gce
+            from app.helpers.schema import get_business_table_names as _get_tables
+            from app.helpers.schema import get_business_table_schemas as _get_schemas
+            _biz_tables = await _get_tables(db)
+            _biz_schemas = await _get_schemas(db)
+            _quick_intent = await _gce().extract_semantic_intent_async(
+                original_query_to_analyze,
+                table_names=_biz_tables,
+                table_schemas=_biz_schemas,
+            )
+            _cached_intent = _quick_intent  # cache for reuse below
+            if _quick_intent.has_unknown_values:
+                logger.debug("[SEMANTIC] Concept extractor flagged unknown values — using LLM orchestrator")
+                skip_semantic_pipeline = False
+            elif _quick_intent.filters:
+                logger.debug(
+                    "[SEMANTIC] Concept extractor found %d filter(s) — fast path will apply them",
+                    len(_quick_intent.filters),
+                )
+        except Exception:
+            pass  # Non-critical; continue with original flag
+
+    if skip_semantic_pipeline:
+        logger.debug(f"[SEMANTIC] ⚡ SKIPPING SEMANTIC PIPELINE (orchestration was skipped for performance)")
+        logger.debug(f"[SEMANTIC] ✅ Fast path - using lightweight query processing")
         semantic_context = None
         semantic_result = None
     else:
         try:
             if tracker:
-                tracker.update(ProgressStep.MATCHING_TABLES, "Semantic search: finding relevant tables...")
-                print(f"🔄 [PROGRESS] Semantic search: finding relevant tables...")
+                tracker.update("table_matching", "Semantic search: finding relevant tables")
             
             orchestrator = await _get_semantic_orchestrator(db)
-            print(f"[SEMANTIC] Starting semantic query pipeline...")
+            logger.debug(f"[SEMANTIC] Starting semantic query pipeline...")
             semantic_result = await orchestrator.execute_semantic_query(original_query_to_analyze)
             
             # ✅ REQUIREMENT E: ENFORCE CONFIDENCE GATE - Return clarification immediately if needed  
@@ -1782,10 +1826,11 @@ async def build_data_query_response(
             has_conversation_history = bool(conversation_history and conversation_history.strip())
             should_skip_confidence_gate = has_conversation_history or (session_manager and len(session_manager.messages) > 0)
             
+            # FIX: The clarification response should be returned when clarification IS needed 
+            # and we're NOT skipping - not the other way around
             if (semantic_result and semantic_result.clarification_needed and not should_skip_confidence_gate):
-                print(f"[SEMANTIC] Confidence gate triggered: {semantic_result.clarification_question}")
-            elif should_skip_confidence_gate:
-                print(f"[SEMANTIC] Skipping confidence gate - existing conversation detected ({len(session_manager.messages) if session_manager else 0} messages)")
+                # Clarification needed for new query without conversation context
+                logger.debug(f"[SEMANTIC] Confidence gate triggered: {semantic_result.clarification_question}")
 
                 question_text = semantic_result.clarification_question or "Could you clarify what data you want to query?"
 
@@ -1846,27 +1891,31 @@ async def build_data_query_response(
                     timestamp=current_timestamp(),
                     original_query=query,
                 )
+            elif should_skip_confidence_gate and semantic_result and semantic_result.clarification_needed:
+                # Skip confidence gate for follow-ups - continue with query processing
+                logger.debug(f"[SEMANTIC] Skipping confidence gate - existing conversation detected ({len(session_manager.messages) if session_manager else 0} messages)")
+                logger.debug(f"[SEMANTIC] Will use follow-up context instead of asking clarification")
             
             # Check if orchestrator succeeded and has retrieval context
             if semantic_result and semantic_result.success and semantic_result.retrieval_context:
                 semantic_context = semantic_result
                 num_tables = len(semantic_result.retrieval_context.top_tables)
                 num_columns = sum(len(cols) for cols in semantic_result.retrieval_context.top_columns_per_table.values())
-                print(f"[SEMANTIC] Pipeline result: {num_tables} tables, {num_columns} columns, "
+                logger.debug(f"[SEMANTIC] Pipeline result: {num_tables} tables, {num_columns} columns, "
                       f"confidence: {semantic_result.confidence_score:.0%}")
-                print(f"[SEMANTIC] Retrieved tables: {semantic_result.retrieval_context.top_tables}")
-                print(f"[SEMANTIC] Columns per table: {list(semantic_result.retrieval_context.top_columns_per_table.keys())}")
+                logger.debug(f"[SEMANTIC] Retrieved tables: {semantic_result.retrieval_context.top_tables}")
+                logger.debug(f"[SEMANTIC] Columns per table: {list(semantic_result.retrieval_context.top_columns_per_table.keys())}")
                 
                 # Log pipeline trace if available
                 if semantic_result.pipeline_trace:
                     stages = list(semantic_result.pipeline_trace.keys())
-                    print(f"[SEMANTIC] Pipeline stages: {' → '.join(stages)}")
+                    logger.debug(f"[SEMANTIC] Pipeline stages: {' → '.join(stages)}")
             else:
                 error_msg = semantic_result.error if semantic_result else "No result returned"
-                print(f"[SEMANTIC] Pipeline did not succeed: {error_msg}")
+                logger.debug(f"[SEMANTIC] Pipeline did not succeed: {error_msg}")
                 semantic_context = None
         except Exception as e:
-            print(f"[SEMANTIC] Warning: Orchestrator exception: {e}")
+            logger.debug(f"[SEMANTIC] Warning: Orchestrator exception: {e}")
             # Continue without semantic context - the system remains backward compatible
             semantic_context = None
     # ✅ REQUIREMENT C+D: Use plan-first SQL from orchestrator if available
@@ -1882,18 +1931,27 @@ async def build_data_query_response(
     plan_first_used = False
     if skip_semantic_pipeline and not semantic_result:
         try:
-            print(f"[PLAN-FIRST] 🧠 Using ChatGPT-style semantic extraction pipeline...")
+            logger.debug(f"[PLAN-FIRST] 🧠 Using ChatGPT-style semantic extraction pipeline...")
+
+            # Stage 1: Reuse concept extraction result from pre-check if available,
+            # otherwise call LLM once (avoids duplicate LLM round-trips).
+            if _cached_intent is not None:
+                semantic_intent = _cached_intent
+                logger.debug("[PLAN-FIRST] Reusing cached concept extraction result")
+            else:
+                from .semantic_concept_extractor import get_concept_extractor
+                concept_extractor = get_concept_extractor()
+                semantic_intent = await concept_extractor.extract_semantic_intent_async(
+                    original_query_to_analyze,
+                    table_names=_biz_tables,
+                    table_schemas=_biz_schemas if _biz_schemas else None,
+                )
             
-            # Stage 1: Extract semantic concepts from query
-            from .semantic_concept_extractor import get_concept_extractor
-            concept_extractor = get_concept_extractor()
-            semantic_intent = concept_extractor.extract_semantic_intent(original_query_to_analyze)
+            logger.debug(f"[PLAN-FIRST] Extracted intent: {semantic_intent.intent.value}")
+            logger.debug(f"[PLAN-FIRST] Entity: {semantic_intent.entity}")
+            logger.debug(f"[PLAN-FIRST] Filters: {[f.concept for f in semantic_intent.filters]}")
             
-            print(f"[PLAN-FIRST] Extracted intent: {semantic_intent.intent.value}")
-            print(f"[PLAN-FIRST] Entity: {semantic_intent.entity}")
-            print(f"[PLAN-FIRST] Filters: {[f.concept for f in semantic_intent.filters]}")
-            
-            # Stage 2-4: Ground concepts and generate SQL from plan
+            # Stage 2-4: Ground concepts and generate SQL from plan (canonical pipeline)
             from .plan_first_sql_generator import get_plan_first_handler
             plan_handler = await get_plan_first_handler(db)
             sql, debug_info = await plan_handler.handle_semantic_intent(semantic_intent)
@@ -1908,7 +1966,7 @@ async def build_data_query_response(
                 original_query_to_analyze, sql, semantic_intent.to_dict()
             )
             
-            print(f"[PLAN-FIRST] Coverage: {coverage_report.completeness_score:.0%}, Missing: {coverage_report.missing_concepts}")
+            logger.debug(f"[PLAN-FIRST] Coverage: {coverage_report.completeness_score:.0%}, Missing: {coverage_report.missing_concepts}")
             
             # If coverage is incomplete, try to improve SQL
             if not coverage_report.is_complete():
@@ -1916,40 +1974,60 @@ async def build_data_query_response(
                     coverage_report, original_query_to_analyze, sql
                 )
                 if improved_sql:
-                    print(f"[PLAN-FIRST] ✅ Applied coverage improvements")
+                    logger.debug(f"[PLAN-FIRST] ✅ Applied coverage improvements")
                     sql = improved_sql
                 else:
-                    print(f"[PLAN-FIRST] ⚠️ Could not improve coverage: {coverage_report.issues}")
+                    logger.debug(f"[PLAN-FIRST] ⚠️ Could not improve coverage: {coverage_report.issues}")
             
             sql_method = "plan-first (ChatGPT-style)"
             plan_first_used = True
             
         except Exception as e:
-            print(f"[PLAN-FIRST] ⚠️ Plan-first pipeline failed, falling back to traditional: {e}")
+            logger.debug(f"[PLAN-FIRST] ⚠️ Plan-first pipeline failed, falling back to traditional: {e}")
             sql = None
             plan_first_used = False
     
     if tracker:
         tables_found = semantic_result.retrieval_context.top_tables if semantic_context else []
-        table_info = f" (tables: {', '.join(tables_found[:3])}{'...' if len(tables_found) > 3 else ''})" if tables_found else ""
-        tracker.update(ProgressStep.GENERATING_SQL, f"Generating SQL via {sql_method}{table_info}")
-        print(f"🔄 [PROGRESS] Generating SQL via {sql_method}{table_info}")
+        table_info = f" (tables: {', '.join(tables_found)})" if tables_found else ""
+        tracker.update("sql_generation", f"Generating SQL via {sql_method}{table_info}")
     
     if semantic_result and semantic_result.success and semantic_result.sql and not plan_first_used:
         # Plan-first path: LLM generated QueryPlan JSON → deterministic renderer → SQL
         sql = semantic_result.sql
-        print(f"[PLAN-FIRST] Using deterministic rendered SQL from orchestrator")
+        logger.debug(f"[PLAN-FIRST] Using deterministic rendered SQL from orchestrator")
     elif not plan_first_used:  # Only use fallback if plan-first wasn't attempted
-        # Fallback: traditional LLM SQL generation (backward compatible)
-        print(f"[FALLBACK] Semantic orchestrator did not produce SQL, using traditional LLM...")
-        sql, clarifying_question = await generate_sql_with_analysis(
-            original_query_to_analyze, 
-            db, 
-            conversation_history, 
-            force_join=force_join,
-            followup_context=followup_context,
-            semantic_context=semantic_context
-        )
+        # Use canonical plan-first fallback instead of legacy LLM SQL generation
+        logger.debug(f"[FALLBACK] Semantic orchestrator did not produce SQL, using plan-first fallback...")
+        try:
+            from .semantic_concept_extractor import get_concept_extractor
+            from .plan_first_sql_generator import get_plan_first_handler
+            
+            concept_extractor = get_concept_extractor()
+            if _biz_tables is None:
+                from app.helpers.schema import get_business_table_names as _get_tables_fb
+                _biz_tables = await _get_tables_fb(db)
+            if not _biz_schemas:
+                from app.helpers.schema import get_business_table_schemas as _get_schemas_fb
+                _biz_schemas = await _get_schemas_fb(db)
+            semantic_intent = await concept_extractor.extract_semantic_intent_async(
+                original_query_to_analyze,
+                table_names=_biz_tables,
+                table_schemas=_biz_schemas if _biz_schemas else None,
+            )
+
+            plan_handler = await get_plan_first_handler(db)
+            sql, _ = await plan_handler.handle_semantic_intent(semantic_intent)
+            
+            logger.debug(f"[FALLBACK] Generated SQL via canonical plan-first pipeline")
+            clarifying_question = None
+            
+        except Exception as fallback_e:
+            logger.debug(f"[FALLBACK] ⚠️ Canonical fallback failed: {fallback_e}")
+            # Last resort: Log warning and return error
+            logger.warning(f"All SQL generation paths failed for query: {original_query_to_analyze}")
+            sql = None
+            clarifying_question = "I couldn't generate a SQL query for your request. Please try rephrasing your question."
     
     # DYNAMIC: Apply semantic column mapping if SQL was generated and NOT from orchestrator or plan-first
     # (Orchestrator and plan-first outputs are already grounded, no need for mapping)
@@ -1966,13 +2044,50 @@ async def build_data_query_response(
             # Add schema prefixes to table references
             sql = add_schema_prefixes_to_sql(sql)
         except Exception as e:
-            print(f"⚠️  Semantic column mapping failed: {e}")
+            logger.debug(f"⚠️  Semantic column mapping failed: {e}")
             # Continue with original SQL if mapping fails
     
+    # FOLLOW-UP WHERE MERGE: If this is a follow-up and the previous SQL had WHERE
+    # conditions, inject them into the new SQL so filters accumulate across turns.
+    # Example: previous "state = 'AP'" + new "EXTRACT(MONTH FROM dob) = 1"
+    #          → merged "state = 'AP' AND EXTRACT(MONTH FROM dob) = 1"
+    if sql and previous_sql and followup_context_from_rag:
+        try:
+            import re as _re
+            _prev_where_match = _re.search(
+                r'\bWHERE\s+(.+?)(?:\s+GROUP\s+BY|\s+ORDER\s+BY|\s+LIMIT|\s*;|\s*$)',
+                previous_sql, _re.I | _re.S
+            )
+            if _prev_where_match:
+                _prev_where = _prev_where_match.group(1).strip()
+                # Only inject if the previous WHERE condition is not already in the new SQL
+                _sql_upper = sql.upper()
+                _prev_where_upper = _prev_where.upper()
+                if _prev_where_upper not in _sql_upper:
+                    _new_where_match = _re.search(
+                        r'\bWHERE\s+(.+?)(\s+GROUP\s+BY\b|\s+ORDER\s+BY\b|\s+LIMIT\b|\s*;|\s*$)',
+                        sql, _re.I | _re.S
+                    )
+                    if _new_where_match:
+                        _new_where = _new_where_match.group(1).strip()
+                        _tail = _new_where_match.group(2)  # Preserve LIMIT/ORDER BY/GROUP BY/etc.
+                        _merged = f"WHERE {_prev_where} AND {_new_where}"
+                        sql = sql[:_new_where_match.start()] + _merged + _tail + sql[_new_where_match.end():]
+                    else:
+                        # No WHERE yet — insert before LIMIT/ORDER BY/end
+                        _insert_match = _re.search(
+                            r'(\s+(?:GROUP\s+BY|ORDER\s+BY|LIMIT)|\s*;|\s*$)', sql, _re.I
+                        )
+                        _insert_pos = _insert_match.start() if _insert_match else len(sql)
+                        sql = sql[:_insert_pos] + f" WHERE {_prev_where}" + sql[_insert_pos:]
+                    logger.info("[FOLLOWUP-MERGE] Merged previous WHERE into new SQL: %s", _prev_where[:60])
+        except Exception as _merge_err:
+            logger.debug("[FOLLOWUP-MERGE] WHERE merge skipped: %s", _merge_err)
+
     # If we got a clarifying question, return it for user confirmation
     # Store the original query context so we can re-execute when user confirms
     if clarifying_question and not sql:
-        print(f"[CLARIFICATION] System needs user confirmation")
+        logger.debug(f"[CLARIFICATION] System needs user confirmation")
 
         cq = schemas.ClarificationQuestionValueInput(
             question=clarifying_question,
@@ -2012,7 +2127,7 @@ async def build_data_query_response(
     
     # If sql is still empty, use LLM fallback
     if not sql:
-        print(f"[FALLBACK] Using LLM to generate SQL...")
+        logger.debug(f"[FALLBACK] Using LLM to generate SQL...")
         
         # Build comprehensive schema context for LLM
         from ..helpers import get_database_schema
@@ -2100,19 +2215,18 @@ Generate the SQL query now (adapt to whatever schema is provided, no assumptions
             # Add schema prefixes to table references (from default LLM often omits schema)
             sql = add_schema_prefixes_to_sql(sql)
             
-            print(f"[OK] LLM Generated SQL: {sql}\n")
+            logger.debug(f"[OK] LLM Generated SQL: {sql}\n")
         except Exception as e:
-            print(f"❌ Failed to generate SQL with LLM: {e}")
+            logger.debug(f"❌ Failed to generate SQL with LLM: {e}")
             raise
     
     # Log generated SQL for debugging
-    print(f"[SQL] {sql}\n")
+    logger.debug(f"[SQL] {sql}\n")
     
     # Extract main table for progress display
-    sql_preview = sql[:60].replace('\n', ' ') if sql else "(no SQL)"
+    sql_preview = sql.replace('\n', ' ') if sql else "(no SQL)"
     if tracker:
-        tracker.update(ProgressStep.VALIDATING_SQL, f"Validating: {sql_preview}...")
-        print(f"🔄 [PROGRESS] Validating: {sql_preview}...")
+        tracker.update("sql_validation", f"Validating: {sql_preview}")
     
     # ✅ CRITICAL: VALIDATE & ENFORCE SAFETY LIMIT BEFORE FIRST EXECUTION
     # This ensures every query gets LIMIT enforcement, not just failed ones
@@ -2121,55 +2235,50 @@ Generate the SQL query now (adapt to whatever schema is provided, no assumptions
     is_safe, validation_error, rewritten_sql = validator.validate_and_rewrite(sql)
     
     if not is_safe:
-        print(f"❌ SQL VALIDATION FAILED: {validation_error}")
+        logger.debug(f"❌ SQL VALIDATION FAILED: {validation_error}")
         raise ValueError(f"SQL validation failed: {validation_error}")
     
     # Use the rewritten SQL (with enforced LIMIT)
     sql = rewritten_sql
-    print(f"[OK] SQL after safety validation (LIMIT enforced): {sql}\n")
+    logger.debug(f"[OK] SQL after safety validation (LIMIT enforced): {sql}\n")
     
     # ============================================================================
     # PHASE 2: QUERY OPTIMIZER - Analyze query performance before execution
     # ============================================================================
     optimizer = QueryOptimizer()
     try:
-        print(f"[OPTIMIZER] Analyzing query performance...")
+        logger.debug(f"[OPTIMIZER] Analyzing query performance...")
         optimization_result = await optimizer.analyze_query(sql, db)
         
-        if optimization_result.has_recommendations:
-            print(f"[OPTIMIZER] Found {len(optimization_result.recommendations)} optimization opportunities:")
+        # FIX: Use correct attribute names from QueryOptimizationResult
+        # The class has: complexity_score, estimated_cost, suggestions, optimized_query
+        if optimization_result.suggestions and len(optimization_result.suggestions) > 0:
+            logger.debug(f"[OPTIMIZER] Found {len(optimization_result.suggestions)} optimization suggestions:")
             
-            # Log critical/high priority recommendations
-            for rec in optimization_result.recommendations:
-                if rec.priority in [OptimizationLevel.CRITICAL, OptimizationLevel.HIGH]:
-                    print(f"  [{rec.priority.value.upper()}] {rec.description}")
-            
-            # Log index recommendations
-            if optimization_result.index_recommendations:
-                print(f"[OPTIMIZER] Index recommendations:")
-                for idx_rec in optimization_result.index_recommendations[:3]:
-                    print(f"  - {idx_rec.table_name}.{','.join(idx_rec.columns)}: {idx_rec.reason}")
+            # Log suggestions
+            for suggestion in optimization_result.suggestions[:3]:
+                logger.debug(f"  [{suggestion.impact.upper()}] {suggestion.suggestion}")
         
         # Store optimization metadata for response
         optimization_metadata = {
-            "performance_score": optimization_result.performance_score,
-            "has_recommendations": optimization_result.has_recommendations,
-            "optimization_summary": optimization_result.summary,
+            "complexity_score": optimization_result.complexity_score,
+            "estimated_cost": optimization_result.estimated_cost,
+            "suggestions_count": len(optimization_result.suggestions) if optimization_result.suggestions else 0,
         }
         
-        # Optionally apply auto-optimizations for critical issues
-        if optimization_result.auto_optimizable_query:
-            print(f"[OPTIMIZER] Applying automatic optimizations...")
-            sql = optimization_result.auto_optimizable_query
-            print(f"[OPTIMIZER] Optimized SQL: {sql}")
+        # Optionally apply auto-optimizations if available
+        if optimization_result.optimized_query:
+            logger.debug(f"[OPTIMIZER] Applying automatic optimizations...")
+            sql = optimization_result.optimized_query
+            logger.debug(f"[OPTIMIZER] Optimized SQL: {sql}")
     except Exception as opt_error:
-        print(f"[OPTIMIZER] Warning: Optimization analysis failed: {opt_error}")
+        logger.debug(f"[OPTIMIZER] Warning: Optimization analysis failed: {opt_error}")
         optimization_metadata = {}
     
     # SMART LIMIT: Count records first, then decide whether to apply LIMIT
-    print(f"[SMART LIMIT] Applying count-first approach to determine if LIMIT needed...")
+    logger.debug(f"[SMART LIMIT] Applying count-first approach to determine if LIMIT needed...")
     sql = await apply_smart_limit(db, sql, threshold=1000)
-    print(f"[SMART LIMIT] Final SQL: {sql}\n")
+    logger.debug(f"[SMART LIMIT] Final SQL: {sql}\n")
     
     # ============================================================================
     # PHASE 4: AUTO-RETRY LOGIC - Wrap SQL execution with intelligent retry
@@ -2177,8 +2286,7 @@ Generate the SQL query now (adapt to whatever schema is provided, no assumptions
     auto_retry_executor = get_auto_retry_executor()
     
     if tracker:
-        tracker.update(ProgressStep.EXECUTING_QUERY, f"Executing against database...")
-        print(f"🔄 [PROGRESS] Executing against database...")
+        tracker.update("query_execution", "Executing against database")
     
     async def execute_sql_operation():
         """SQL execution operation for auto-retry."""
@@ -2208,14 +2316,14 @@ Generate the SQL query now (adapt to whatever schema is provided, no assumptions
             
             # Skip recovery for type errors - they're handled in type_converter
             if is_type_error:
-                print(f"⚠️  Type mismatch/operator error detected (recoverable by type conversion layer): {error_msg[:100]}")
-                print(f"🔧 Type converter should handle this - check type_converter.py")
+                logger.debug(f"⚠️  Type mismatch/operator error detected (recoverable by type conversion layer): {error_msg[:100]}")
+                logger.debug(f"🔧 Type converter should handle this - check type_converter.py")
                 raise
             
             if (is_undefined_error or is_enum_error) and retry_count < max_retries - 1:
                 
-                print(f"⚠️  SQL error detected: {error_msg}")
-                print(f"🔄 Attempting to regenerate SQL with error context...")
+                logger.debug(f"⚠️  SQL error detected: {error_msg}")
+                logger.debug(f"🔄 Attempting to regenerate SQL with error context...")
                 
                 # Get schema again to ensure we have latest info
                 from ..helpers import get_database_schema
@@ -2252,7 +2360,7 @@ Generate the SQL query now (adapt to whatever schema is provided, no assumptions
                             table_columns_info += f"\n- Look for columns matching user intent"
                             table_columns_info += f"\n- DO NOT jump to different tables! Stay with {main_table}."
                     except Exception as col_err:
-                        print(f"[DEBUG] Could not get columns for {main_table} using {adapter.db_type.value}: {col_err}")
+                        logger.debug(f"[DEBUG] Could not get columns for {main_table} using {adapter.db_type.value}: {col_err}")
                         table_columns_info = f"\n\nERROR: Could not retrieve columns for {main_table}"
                         table_columns_info += f"\nTry to infer correct column from user intent: {query.lower()}"
                         table_columns_info += f"\nDO NOT jump to different tables! Stay with {main_table}."
@@ -2299,7 +2407,7 @@ Output ONLY corrected SQL, nothing else:"""
                         col_names = [col[0] for col in columns]  # Keep original casing
                         col_names_lower = [col[0].lower() for col in columns]
                         
-                        print(f"[DEBUG] Searching for match for '{bad_col}' in {len(col_names)} columns")
+                        logger.debug(f"[DEBUG] Searching for match for '{bad_col}' in {len(col_names)} columns")
                         
                         # Strategy 1: Direct substring matching
                         for col_name, col_type in columns:
@@ -2309,11 +2417,11 @@ Output ONLY corrected SQL, nothing else:"""
                             # Check various substring patterns
                             if bad_lower in col_lower or col_lower in bad_lower:
                                 suggested_cols.append(col_name)
-                                print(f"[DEBUG]   Matched by substring: {bad_col} → {col_name}")
+                                logger.debug(f"[DEBUG]   Matched by substring: {bad_col} → {col_name}")
                             elif any(part in col_lower for part in bad_lower.split('_')):
                                 # If bad_col has multiple parts, try partial matching
                                 suggested_cols.append(col_name)
-                                print(f"[DEBUG]   Matched by token: {bad_col} → {col_name}")
+                                logger.debug(f"[DEBUG]   Matched by token: {bad_col} → {col_name}")
                         
                         # Strategy 2: LLM-based semantic column matching (no hardcoded keywords)
                         if not suggested_cols:
@@ -2325,7 +2433,7 @@ Output ONLY corrected SQL, nothing else:"""
                                 # Match if any query token appears in column tokens
                                 if query_tokens & col_tokens:
                                     suggested_cols.append(col_name)
-                                    print(f"[DEBUG]   Matched by query token overlap: {bad_col} → {col_name}")
+                                    logger.debug(f"[DEBUG]   Matched by query token overlap: {bad_col} → {col_name}")
                         
                         # Remove duplicates while preserving order
                         suggested_cols = list(dict.fromkeys(suggested_cols))
@@ -2336,13 +2444,13 @@ Output ONLY corrected SQL, nothing else:"""
                         # Look for column definitions in schema text
                         col_patterns = re.findall(r'(\w+)\s+(?:boolean|integer|text|varchar|timestamp|numeric)', schema_info, re.IGNORECASE)
                         
-                        print(f"[DEBUG] Extracting columns from schema text: found {len(col_patterns)}")
+                        logger.debug(f"[DEBUG] Extracting columns from schema text: found {len(col_patterns)}")
                         
                         for col_name in col_patterns:
                             col_lower = col_name.lower()
                             if bad_col_lower in col_lower or col_lower in bad_col_lower:
                                 suggested_cols.append(col_name)
-                                print(f"[DEBUG]   Matched from schema: {bad_col} → {col_name}")
+                                logger.debug(f"[DEBUG]   Matched from schema: {bad_col} → {col_name}")
                         
                         suggested_cols = list(dict.fromkeys(suggested_cols))
                     
@@ -2459,9 +2567,9 @@ Generate corrected SQL only, nothing else."""
                 
                 try:
                     # Debug: Show what we're sending to LLM
-                    print(f"[DEBUG] Error recovery context for table '{main_table}':")
-                    print(f"[DEBUG] Conversation history: {conversation_history[:200] if conversation_history else '(empty)'}")
-                    print(f"[DEBUG] Table columns info length: {len(table_columns_info)}")
+                    logger.debug(f"[DEBUG] Error recovery context for table '{main_table}':")
+                    logger.debug(f"[DEBUG] Conversation history: {conversation_history[:200] if conversation_history else '(empty)'}")
+                    logger.debug(f"[DEBUG] Table columns info length: {len(table_columns_info)}")
                     
                     fixed_sql = await llm.call_llm(fix_messages, stream=False, max_tokens=512)
                     
@@ -2522,8 +2630,8 @@ Generate corrected SQL only, nothing else."""
                         # Check if it's trying to use different tables
                         if regenerated_tables and main_table not in regenerated_tables:
                             # LLM tried to jump to a different table - reject it
-                            print(f"❌ ERROR RECOVERY FAILED: LLM tried to jump from '{main_table}' to '{regenerated_tables[0]}'")
-                            print(f"❌ This is a FOLLOW-UP query and must stay with {main_table}")
+                            logger.debug(f"❌ ERROR RECOVERY FAILED: LLM tried to jump from '{main_table}' to '{regenerated_tables[0]}'")
+                            logger.debug(f"❌ This is a FOLLOW-UP query and must stay with {main_table}")
                             raise ValueError(f"LLM attempted to jump tables: from {main_table} to {regenerated_tables[0]}")
                     
                     # Validate and rewrite the fixed SQL using new architecture
@@ -2534,10 +2642,10 @@ Generate corrected SQL only, nothing else."""
                     if not is_safe:
                         raise ValueError(f"SQL validation failed: {error}")
                     sql = rewritten_sql  # Use the rewritten SQL with safety LIMIT
-                    print(f"[OK] Regenerated SQL (with safety limit): {sql}\n")
+                    logger.debug(f"[OK] Regenerated SQL (with safety limit): {sql}\n")
                     retry_count += 1
                 except Exception as regen_error:
-                    print(f"❌ Failed to regenerate SQL: {regen_error}")
+                    logger.debug(f"❌ Failed to regenerate SQL: {regen_error}")
                     raise last_error  # Re-raise original error
             else:
                 # Not a recoverable error or max retries reached
@@ -2547,8 +2655,8 @@ Generate corrected SQL only, nothing else."""
         raise last_error or Exception("Failed to execute query")
     
     if tracker:
-        tracker.update(ProgressStep.PROCESSING_RESULTS, f"Processing {len(rows)} results...")
-        print(f"🔄 [PROGRESS] Processing {len(rows)} results...")
+        tracker.done("query_execution", f"Returned {len(rows)} rows")
+        tracker.update("result_processing", f"Analysing {len(rows)} rows")
     
     # ============================================================================
     # PHASE 2: RESULT VERIFIER - Validate results and detect hallucinations
@@ -2557,7 +2665,7 @@ Generate corrected SQL only, nothing else."""
     validation_metadata = {}
     
     try:
-        print(f"[VERIFIER] Validating {len(rows)} results for hallucinations...")
+        logger.debug(f"[VERIFIER] Validating {len(rows)} results for hallucinations...")
         
         # Get schema info for verification
         from ..helpers import get_database_schema
@@ -2567,39 +2675,39 @@ Generate corrected SQL only, nothing else."""
             schema_info_for_validation = schema_info  # Use cached version
         
         # Verify results
+        # FIX: Remove user_query parameter - not in method signature
         validation_result = await verifier.verify_results(
             sql=sql,
             results=rows,
             schema_info=schema_info_for_validation,
             db_session=db,
-            user_query=query,
         )
         
-        print(f"[VERIFIER] Validation complete:")
-        print(f"  - Confidence score: {validation_result.confidence_score:.0%}")
-        print(f"  - Hallucination detected: {validation_result.hallucination_detected}")
-        print(f"  - Issues found: {len(validation_result.issues)}")
+        logger.debug(f"[VERIFIER] Validation complete:")
+        logger.debug(f"  - Confidence score: {getattr(validation_result, 'confidence_score', 0.0):.0%}")
+        logger.debug(f"  - Hallucination detected: {getattr(validation_result, 'hallucination_detected', False)}")
+        logger.debug(f"  - Issues found: {len(getattr(validation_result, 'issues', []))}")
         
         # Log any validation issues
         if validation_result.issues:
             for issue in validation_result.issues[:3]:  # Show first 3
-                print(f"  [{issue.severity.value.upper()}] {issue.description}")
+                logger.debug(f"  [{issue.severity.value.upper()}] {issue.description}")
         
-        # Store validation metadata
+        # Store validation metadata with safe attribute access
         validation_metadata = {
-            "confidence_score": validation_result.confidence_score,
-            "is_valid": validation_result.is_valid,
-            "hallucination_detected": validation_result.hallucination_detected,
-            "validation_summary": f"{len(validation_result.issues)} issues, {len(validation_result.warnings)} warnings",
+            "confidence_score": getattr(validation_result, 'confidence_score', 0.0),
+            "is_valid": getattr(validation_result, 'is_valid', True),
+            "hallucination_detected": getattr(validation_result, 'hallucination_detected', False),
+            "validation_summary": f"{len(getattr(validation_result, 'issues', []))} issues, {len(getattr(validation_result, 'warnings', []))} warnings",
         }
         
         # If critical hallucination detected, add warning to response
         if validation_result.hallucination_detected and not validation_result.is_valid:
-            print(f"[VERIFIER] ⚠️ CRITICAL: Hallucination detected in results!")
+            logger.debug(f"[VERIFIER] ⚠️ CRITICAL: Hallucination detected in results!")
             # Could trigger regeneration here, but for now just log
             
     except Exception as verify_error:
-        print(f"[VERIFIER] Warning: Result verification failed: {verify_error}")
+        logger.debug(f"[VERIFIER] Warning: Result verification failed: {verify_error}")
         validation_metadata = {"verification_error": str(verify_error)}
     
     # Check if this should be returned as a simple message (for follow-up questions)
@@ -2656,8 +2764,7 @@ Generate corrected SQL only, nothing else."""
     
     # For multi-row or complex results, determine best visualization and generate message
     if tracker:
-        tracker.update(ProgressStep.GENERATING_VISUALIZATION, f"Generating visualizations for {len(rows)} rows...")
-        print(f"🔄 [PROGRESS] Generating visualizations for {len(rows)} rows...")
+        tracker.update("visualization", f"Building visualizations for {len(rows)} rows")
     
     chart_type, viz_message, viz_title = await determine_visualization_type(
         query, rows, should_use_message=should_use_message
@@ -2671,37 +2778,43 @@ Generate corrected SQL only, nothing else."""
     
     if rows and len(rows) > 0:
         try:
-            print(f"[RESULT_INTERPRETER] Analyzing {len(rows)} rows for insights...")
+            logger.debug(f"[RESULT_INTERPRETER] Analyzing {len(rows)} rows for insights...")
             result_interpreter = get_result_interpreter()
             
-            # Interpret results
-            interpretation = await result_interpreter.interpret(
-                query_results=rows,
-                query_text=query,
-                column_names=[k for k in rows[0].keys()] if rows else [],
-            )
+            # Interpret results - handle interface mismatch
+            if hasattr(result_interpreter, 'interpret'):
+                interpretation = await result_interpreter.interpret(
+                    query_results=rows,
+                    query_text=query,
+                    column_names=[k for k in rows[0].keys()] if rows else [],
+                )
+            else:
+                logger.debug(f"[RESULT_INTERPRETER] Warning: No 'interpret' method found, skipping")
+                interpretation = None
             
-            # Extract insights
-            insights = [
-                {
-                    "type": insight.insight_type.value,
-                    "description": insight.description,
-                    "priority": insight.priority.value,
-                    "value": insight.value,
-                }
-                for insight in interpretation.insights[:5]  # Top 5 insights
-            ]
-            
-            # Get visualization recommendations
-            visualization_recommendations = interpretation.visualization_recommendations
+            # Extract insights if interpretation succeeded
+            if interpretation and hasattr(interpretation, 'insights'):
+                insights = [
+                    {
+                        "type": insight.insight_type.value,
+                        "description": insight.description,
+                        "priority": insight.priority.value,
+                        "value": insight.value,
+                    }
+                    for insight in interpretation.insights[:5]  # Top 5 insights
+                ]
+                
+                # Get visualization recommendations
+                if hasattr(interpretation, 'visualization_recommendations'):
+                    visualization_recommendations = interpretation.visualization_recommendations
             
             if insights:
-                print(f"[RESULT_INTERPRETER] Generated {len(insights)} insights")
+                logger.debug(f"[RESULT_INTERPRETER] Generated {len(insights)} insights")
                 for insight in insights[:3]:
-                    print(f"  [{insight['priority'].upper()}] {insight['description']}")
+                    logger.debug(f"  [{insight['priority'].upper()}] {insight['description']}")
             
         except Exception as interp_error:
-            print(f"[RESULT_INTERPRETER] Warning: Interpretation failed: {interp_error}")
+            logger.debug(f"[RESULT_INTERPRETER] Warning: Interpretation failed: {interp_error}")
     
     # Generate related follow-up queries
     related_queries = []
@@ -2725,7 +2838,7 @@ Return ONLY as JSON: {{"related_queries": ["question1", "question2", "question3"
         
         # Handle case where response is empty or None
         if not related_response_text:
-            print("[DEBUG] LLM returned empty response for related queries")
+            logger.debug("[DEBUG] LLM returned empty response for related queries")
             related_queries = []
         else:
             # Make sure response_text is a string
@@ -2736,7 +2849,7 @@ Return ONLY as JSON: {{"related_queries": ["question1", "question2", "question3"
             response_str = str(related_response_text).strip()
             
             if not response_str:
-                print("[DEBUG] LLM response is empty after stripping")
+                logger.debug("[DEBUG] LLM response is empty after stripping")
                 related_queries = []
             else:
                 # Extract JSON if wrapped in text
@@ -2747,13 +2860,13 @@ Return ONLY as JSON: {{"related_queries": ["question1", "question2", "question3"
                     related_response = json.loads(json_str)
                     related_queries = related_response.get("related_queries", [])[:3]
                 else:
-                    print(f"[DEBUG] No JSON found in LLM response: {response_str[:100]}")
+                    logger.debug(f"[DEBUG] No JSON found in LLM response: {response_str[:100]}")
                     related_queries = []
     except json.JSONDecodeError as e:
-        print(f"⚠️  JSON decode error for related queries: {e}")
+        logger.debug(f"⚠️  JSON decode error for related queries: {e}")
         related_queries = []
     except Exception as e:
-        print(f"⚠️  Failed to generate related queries: {e}")
+        logger.debug(f"⚠️  Failed to generate related queries: {e}")
         related_queries = []
     
     # ============================================================================
@@ -2764,7 +2877,7 @@ Return ONLY as JSON: {{"related_queries": ["question1", "question2", "question3"
     
     if rows and len(rows) > 0:
         try:
-            print(f"[RESULT_INTERPRETER] Analyzing {len(rows)} rows for insights...")
+            logger.debug(f"[RESULT_INTERPRETER] Analyzing {len(rows)} rows for insights...")
             result_interpreter = get_result_interpreter()
             
             # Interpret results
@@ -2789,12 +2902,12 @@ Return ONLY as JSON: {{"related_queries": ["question1", "question2", "question3"
             viz_recommendations = interpretation.visualization_recommendations
             
             if insights:
-                print(f"[RESULT_INTERPRETER] Generated {len(insights)} insights")
+                logger.debug(f"[RESULT_INTERPRETER] Generated {len(insights)} insights")
                 for insight in insights[:3]:
-                    print(f"  [{insight['priority'].upper()}] {insight['description']}")
+                    logger.debug(f"  [{insight['priority'].upper()}] {insight['description']}")
             
         except Exception as interp_error:
-            print(f"[RESULT_INTERPRETER] Warning: Interpretation failed: {interp_error}")
+            logger.debug(f"[RESULT_INTERPRETER] Warning: Interpretation failed: {interp_error}")
     
     # Build datasets
     dataset_id = "q1"
@@ -2832,28 +2945,115 @@ Return ONLY as JSON: {{"related_queries": ["question1", "question2", "question3"
     
     if tracker:
         columns_count = len(rows[0].keys()) if rows else 0
-        tracker.update(ProgressStep.FORMATTING_RESPONSE, f"Formatting response ({len(rows)} rows, {columns_count} columns)")
-        print(f"🔄 [PROGRESS] Formatting response ({len(rows)} rows, {columns_count} columns)")
+        tracker.update("formatting", f"Formatting response ({len(rows)} rows, {columns_count} columns)")
     
     # Use ResponseComposer for ChatGPT-like response framing with AI-powered visualizations
     from .response_composer import ResponseComposer
     import time
     
-    # Compose SQL response with emoji, structured formatting, and DYNAMIC visualizations
-    assistant, artifacts, _, visualizations = await ResponseComposer.compose_sql_response_async(
+    # PERFORMANCE OPTIMIZATION: For simple SELECT * queries, use fast path with minimal LLM calls
+    is_simple_select = (
+        sql.strip().upper().startswith('SELECT') and 
+        'SELECT *' in sql.upper() and
+        len(rows) > 0 and
+        len(rows) <= 1000
+    )
+    
+    # Compose SQL response with LLM narrative, dynamic follow-ups, and visualizations
+    assistant, artifacts, followups, visualizations = await ResponseComposer.compose_sql_response_async(
         query=sql,
         results=rows,
-        execution_time=0.1,  # Approximate execution time
+        execution_time=0.1,
         intent="run_sql",
+        skip_llm_calls=is_simple_select,
+        user_query=query,  # Pass original NL question for narrative + follow-ups
     )
-    
-    # Generate DYNAMIC follow-ups based on actual query results
-    followups = await ResponseComposer.generate_dynamic_sql_followups(
-        results=rows,
-        user_query=query,
-        sql_query=sql
-    )
-    
+
+    # -----------------------------------------------------------------------
+    # INSIGHT INJECTION — surface top insights as visible callout blocks
+    # -----------------------------------------------------------------------
+    content_blocks = [block.to_dict() for block in assistant.content]
+    if insights:
+        _priority_map = {"high": "warning", "medium": "info", "low": "info", "critical": "error"}
+        insight_callouts = [
+            {
+                "type": "callout",
+                "variant": _priority_map.get(ins.get("priority", "low"), "info"),
+                "text": ins.get("description", ""),
+            }
+            for ins in insights[:3]  # max 3 visible insights
+            if ins.get("description")
+        ]
+        # Insert insight callouts BEFORE the last "next steps" callout
+        if insight_callouts and len(content_blocks) > 1:
+            content_blocks = content_blocks[:-1] + insight_callouts + [content_blocks[-1]]
+        else:
+            content_blocks = content_blocks + insight_callouts
+
+    # -----------------------------------------------------------------------
+    # METRIC CARD — for single-row aggregate results (COUNT, SUM, AVG, etc.)
+    # -----------------------------------------------------------------------
+    _col_names = list(rows[0].keys()) if rows else []
+    if len(rows) == 1 and len(_col_names) <= 3:
+        # Single-row result → likely a KPI ("how many customers?", "total revenue")
+        for _col, _val in rows[0].items():
+            if isinstance(_val, (int, float)) and _val is not None:
+                _label = _col.replace("_", " ").title()
+                content_blocks.insert(
+                    1,  # right after the intro paragraph
+                    {
+                        "type": "metric_card",
+                        "label": _label,
+                        "value": _val,
+                        "unit": "$" if any(k in _col.lower() for k in ("amount", "revenue", "price", "salary", "balance")) else "",
+                    },
+                )
+                break  # one metric card is enough
+
+    # -----------------------------------------------------------------------
+    # PAGINATION METADATA
+    # -----------------------------------------------------------------------
+    _total_rows = len(rows)
+    _display_limit = 10  # ResponseComposer shows first 10 in the table block
+    _has_more = _total_rows > _display_limit
+
+    # -----------------------------------------------------------------------
+    # ARTIFACT-CENTRIC RESPONSE ARCHITECTURE (ResponseGeneration.md)
+    # Deterministic shape analysis + artifact planning (zero LLM calls)
+    # -----------------------------------------------------------------------
+    try:
+        from .result_shape_analyzer import ResultShapeAnalyzer
+        from .artifact_planner import ArtifactPlanner
+
+        _shape = ResultShapeAnalyzer.analyze(sql=sql, rows=rows)
+        _render_artifacts = ArtifactPlanner.plan(
+            shape=_shape, rows=rows, user_query=query, row_count=_total_rows
+        )
+        _data_payload = schemas.DataPayload(
+            kind="sql_result",
+            columns=_shape.column_metas,
+            rows=rows[:1000],
+            row_count=_total_rows,
+            truncated=_total_rows > 1000,
+            total_available_rows=_total_rows,
+        )
+        _exec_meta = {
+            "sql": sql,
+            "limit_applied": bool(_total_rows >= 1000 or "LIMIT" in sql.upper()),
+            "sql_safe": True,
+            "execution_time_ms": None,
+            "sources": ["database"],
+            "warnings": [],
+        }
+        _answer_type = _shape.answer_type
+        logger.debug("[QUERY_HANDLER] Shape=%s artifacts=%d", _answer_type, len(_render_artifacts))
+    except Exception as _shape_err:
+        logger.warning("[QUERY_HANDLER] Artifact planning failed (non-critical): %s", _shape_err)
+        _render_artifacts = []
+        _data_payload = None
+        _exec_meta = {"sql": sql, "sql_safe": True}
+        _answer_type = None
+
     # Build ChatGPT-like response
     response = schemas.LamaResponse(
         id=f"msg_{int(time.time() * 1000)}",
@@ -2864,7 +3064,7 @@ Return ONLY as JSON: {{"related_queries": ["question1", "question2", "question3"
         assistant={
             "role": "assistant",
             "title": assistant.title,
-            "content": [block.to_dict() for block in assistant.content],
+            "content": content_blocks,
         },
         artifacts=artifacts.to_dict(),
         visualizations=schemas.Visualization(**visualizations) if visualizations else None,
@@ -2874,10 +3074,15 @@ Return ONLY as JSON: {{"related_queries": ["question1", "question2", "question3"
             "confidence": 0.9,
         },
         followups=[fu.to_dict() for fu in followups],
+        total_rows=_total_rows,
+        has_more=_has_more,
+        column_names=_col_names,
         debug={
             "normalized_user_request": query,
             "sql_executed": sql,
-            "row_count": len(rows),
+            "row_count": _total_rows,
+            "columns": _col_names,  # Used by QuestionBackEngine in routes
+            "result_rows": rows if rows else [],  # CRITICAL: Include actual rows so STEP 9 doesn't re-execute
             "complexity": "medium",
             "optimization": optimization_metadata if 'optimization_metadata' in locals() else {},
             "validation": validation_metadata if 'validation_metadata' in locals() else {},
@@ -2885,7 +3090,12 @@ Return ONLY as JSON: {{"related_queries": ["question1", "question2", "question3"
             "visualization_recommendations": viz_recommendations if viz_recommendations else [],
             # CRITICAL FIX: Include plan-first debug info for ChatGPT-level session architecture
             "plan_first_info": plan_first_debug_info if 'plan_first_debug_info' in locals() else None,
-        }
+        },
+        # ── Artifact-centric response architecture (ResponseGeneration.md) ─
+        answer_type=_answer_type,
+        data=_data_payload,
+        render_artifacts=_render_artifacts,
+        execution_meta=_exec_meta,
     )
     return schemas.ResponseWrapper(
         success=True,
@@ -2931,8 +3141,9 @@ async def build_file_query_response(
         file_names += f" +{file_count - 2} more"
     
     if tracker:
-        tracker.update(ProgressStep.VALIDATING, f"Processing {file_count} file(s): {file_names}")
-        print(f"\n🔄 [PROGRESS] Processing {file_count} file(s): {file_names}")
+        # Plan is set to structured/unstructured after extension detection below;
+        # emit the upload step now with a temporary label.
+        tracker.update("file_upload", f"Uploading {file_count} file(s): {file_names}")
     
     from .response_composer import ResponseComposer
     from .dynamic_visualization_generator import DynamicVisualizationGenerator
@@ -2957,8 +3168,7 @@ async def build_file_query_response(
     
     if tracker:
         file_types = list(set([f.filename.split('.')[-1].upper() if '.' in f.filename else 'FILE' for f in files]))
-        tracker.update(ProgressStep.ANALYZING_INTENT, f"Analyzing {len(files)} {'/'.join(file_types)} file(s)...")
-        print(f"🔄 [PROGRESS] Analyzing {len(files)} {'/'.join(file_types)} file(s)...")
+        tracker.update("file_parsing", f"Parsing {len(files)} {'/'.join(file_types)} file(s)")
     
     # ============================================================================
     # PHASE 1: DETECT FILE TYPE AND COMPLEXITY
@@ -2971,8 +3181,12 @@ async def build_file_query_response(
         file_extension = first_file_obj.filename.lower().split('.')[-1] if '.' in first_file_obj.filename else ""
         is_structured_data = file_extension in ['csv', 'xlsx', 'xls']
         
-    print(f"[FILE ANALYSIS] File type: {file_extension}, Structured: {is_structured_data}")
-    
+    logger.debug(f"[FILE ANALYSIS] File type: {file_extension}, Structured: {is_structured_data}")
+    # Set dynamic plan now that we know the file type
+    if tracker:
+        tracker.set_plan(PLAN_FILE_STRUCTURED if is_structured_data else PLAN_FILE_UNSTRUCTURED)
+        tracker.done("file_upload", f"Uploaded {file_count} {file_extension.upper()} file(s)")
+
     # ============================================================================
     # PHASE 2: ENHANCED ANALYSIS PLANNING FOR COMPLEX QUERIES
     # ============================================================================
@@ -3005,7 +3219,7 @@ Return only "complex" or "simple"."""
     is_complex = await _is_complex_analysis_query(query)
     if is_complex:
         try:
-            print(f"[FILE ANALYSIS] Complex query detected, using enhanced planner")
+            logger.debug(f"[FILE ANALYSIS] Complex query detected, using enhanced planner")
             planner = EnhancedAnalysisPlanner(db)
             analysis_plan = await planner.create_plan(
                 user_query=query,
@@ -3016,48 +3230,53 @@ Return only "complex" or "simple"."""
                 }
             )
             use_advanced_planning = True
-            print(f"[FILE ANALYSIS] Created plan with {len(analysis_plan.steps)} steps, complexity: {analysis_plan.complexity.value}")
+            logger.debug(f"[FILE ANALYSIS] Created plan with {len(analysis_plan.steps)} steps, complexity: {analysis_plan.complexity.value}")
         except Exception as e:
-            print(f"[FILE ANALYSIS] Planning failed, using standard flow: {e}")
+            logger.debug(f"[FILE ANALYSIS] Planning failed, using standard flow: {e}")
     
     # ============================================================================
-    # PHASE 3: PARSE STRUCTURED DATA (CSV/EXCEL)
+    # PHASE 3: QUERY STRUCTURED DATA VIA StructuredFileEngine (CSV/EXCEL)
     # ============================================================================
-    if is_structured_data and first_file_obj and first_file_obj.content_text:
+    struct_result = None
+    if is_structured_data:
         try:
-            print(f"[FILE ANALYSIS] Parsing structured data from {file_extension}")
-            # Re-read the file content to get structured data
-            # The content_text is pandas df.to_string() output, but we need the actual data
-            # So we need to re-parse from the original file
-            from sqlalchemy import select
-            file_record = await db.execute(
-                select(models.UploadedFile).where(models.UploadedFile.id == first_file_obj.id)
+            from .structured_file_engine import get_structured_file_engine
+            _sfe = get_structured_file_engine()
+
+            # Re-seek the UploadFile stream (consumed earlier by add_file)
+            _struct_upload = next(
+                (f for f in files
+                 if f.filename and f.filename.lower().rsplit(".", 1)[-1] in ("csv", "xlsx", "xls")),
+                None,
             )
-            file_obj = file_record.scalar_one_or_none()
-            
-            if file_obj:
-                # Note: We don't have the binary data stored, so we'll parse from content_text
-                # This is a limitation - ideally store binary data or re-read
-                # For now, we'll work with the text representation
-                # Try to parse the table-formatted string back to structured data
-                lines = first_file_obj.content_text.strip().split('\n')
-                if len(lines) > 1:
-                    # Simple heuristic: if we have structured text, parse it
-                    # This is a workaround - in production, store original data
-                    try:
-                        # Try to convert string table back to dict rows (best effort)
-                        df_text = first_file_obj.content_text
-                        # For CSV, the content_text IS the df.to_string() output
-                        # We can try to parse it back
-                        import re
-                        # This is a simplified parser - may not work for all cases
-                        # Better approach: store binary data in DB
-                        structured_data_rows = [{"content": df_text}]  # Fallback
-                    except:
-                        pass
-                        
-        except Exception as e:
-            print(f"[FILE ANALYSIS] Failed to parse structured data: {e}")
+            if _struct_upload:
+                await _struct_upload.seek(0)
+                _raw_bytes = await _struct_upload.read()
+                _df = _sfe.load_dataframe(_raw_bytes, _struct_upload.filename or "")
+                if not _df.empty:
+                    struct_result = await _sfe.query(
+                        df=_df,
+                        user_query=query,
+                        file_id=first_file_id or "",
+                        filename=first_file_obj.filename if first_file_obj else "",
+                        conversation_history=conversation_history,
+                    )
+                    structured_data_rows = struct_result.rows
+                    logger.info(
+                        "[FILE_QUERY] StructuredFileEngine: %d rows for '%s'",
+                        struct_result.row_count, query,
+                    )
+                    if tracker:
+                        tracker.done(
+                            "pandas_query",
+                            f"Query returned {struct_result.row_count} rows"
+                            + (" (truncated)" if struct_result.is_truncated else ""),
+                            metadata={"row_count": struct_result.row_count, "pandas_code": struct_result.query_code[:120]},
+                        )
+        except Exception as _sfe_err:
+            logger.warning("[FILE_QUERY] StructuredFileEngine failed, using text fallback: %s", _sfe_err)
+            if tracker:
+                tracker.skip("pandas_query", "Structured query failed — using text summary")
     
     # ============================================================================
     # PHASE 4: GENERATE PYTHON CODE FOR DATA ANALYSIS (CSV/EXCEL)
@@ -3067,7 +3286,7 @@ Return only "complex" or "simple"."""
     
     if is_structured_data and first_file_obj:
         try:
-            print(f"[FILE ANALYSIS] Generating Python analysis code")
+            logger.debug(f"[FILE ANALYSIS] Generating Python analysis code")
             
             # Generate pandas code for analysis task
             generated_code = await generate_python_code_for_task(
@@ -3080,28 +3299,36 @@ Return only "complex" or "simple"."""
             )
             
             code_description = f"Python code generated for data analysis of {first_file_obj.filename}"
-            print(f"[FILE ANALYSIS] Generated {len(generated_code)} chars of Python code")
+            logger.debug(f"[FILE ANALYSIS] Generated {len(generated_code)} chars of Python code")
             
         except Exception as e:
-            print(f"[FILE ANALYSIS] Code generation failed: {e}")
+            logger.debug(f"[FILE ANALYSIS] Code generation failed: {e}")
     
     # Generate summary using LLM with conversation context
     if tracker:
-        tracker.update(ProgressStep.PROCESSING_RESULTS, "Generating summary and analysis...")
-        print(f"🔄 [PROGRESS] Generating summary and analysis...")
+        tracker.update("insight_analysis", "Generating summary and insights")
     
     summary_text = ""
-    if first_file_obj and first_file_obj.content_text:
+    if struct_result and struct_result.rows:
+        # Structured file was queried successfully — build a targeted narrative
+        _fname = struct_result.filename or "the file"
+        _rc = struct_result.row_count
+        summary_text = f"Queried **{_fname}** and found **{_rc}** matching record(s)."
+        if struct_result.is_truncated:
+            summary_text += f" Results have been truncated to {len(struct_result.rows)} rows."
+        if struct_result.error:
+            summary_text += f" Note: {struct_result.error}"
+    elif first_file_obj and first_file_obj.content_text:
         system_prompt = (
             "You are a helpful assistant that provides structured summaries of documents. "
             "Provide a well-organized summary with headings, key points, and actionable insights."
         )
-        
+
         # Include conversation history for follow-up context
         user_content = first_file_obj.content_text[:3000]
         if conversation_history:
             user_content = f"Previous conversation:\n{conversation_history}\n\nFile content:\n{user_content}\n\nUser query: {query}"
-        
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -3116,7 +3343,7 @@ Return only "complex" or "simple"."""
     
     if structured_data_rows or (first_file_obj and first_file_obj.content_text):
         try:
-            print(f"[RESULT_INTERPRETER] Analyzing file content for insights...")
+            logger.debug(f"[RESULT_INTERPRETER] Analyzing file content for insights...")
             result_interpreter = get_result_interpreter()
             
             # For structured data, use actual rows; for text, create a summary row
@@ -3146,12 +3373,12 @@ Return only "complex" or "simple"."""
             visualization_recommendations = interpretation.visualization_recommendations
             
             if insights:
-                print(f"[RESULT_INTERPRETER] Generated {len(insights)} insights for file")
+                logger.debug(f"[RESULT_INTERPRETER] Generated {len(insights)} insights for file")
                 for insight in insights[:3]:
-                    print(f"  [{insight['priority'].upper()}] {insight['description']}")
+                    logger.debug(f"  [{insight['priority'].upper()}] {insight['description']}")
             
         except Exception as interp_error:
-            print(f"[RESULT_INTERPRETER] Warning: File interpretation failed: {interp_error}")
+            logger.debug(f"[RESULT_INTERPRETER] Warning: File interpretation failed: {interp_error}")
     
     # ============================================================================
     # PHASE 6: DYNAMIC VISUALIZATION GENERATION (CSV/EXCEL)
@@ -3160,12 +3387,11 @@ Return only "complex" or "simple"."""
     
     if tracker:
         row_info = f" ({len(structured_data_rows)} rows)" if structured_data_rows else ""
-        tracker.update(ProgressStep.GENERATING_VISUALIZATION, f"Generating visualizations{row_info}...")
-        print(f"🔄 [PROGRESS] Generating visualizations{row_info}...")
+        tracker.update("visualization", f"Building visualizations{row_info}")
     
     if is_structured_data and structured_data_rows:
         try:
-            print(f"[FILE ANALYSIS] Generating visualizations for structured data")
+            logger.debug(f"[FILE ANALYSIS] Generating visualizations for structured data")
             
             # Generate AI-powered visualizations
             visualizations = await DynamicVisualizationGenerator.generate_multi_viz(
@@ -3173,16 +3399,15 @@ Return only "complex" or "simple"."""
                 fields_info=None  # Will auto-detect from data
             )
             
-            print(f"[FILE ANALYSIS] Generated visualizations: {visualizations.get('type', 'unknown')}")
+            logger.debug(f"[FILE ANALYSIS] Generated visualizations: {visualizations.get('type', 'unknown')}")
             
         except Exception as viz_error:
-            print(f"[FILE ANALYSIS] Visualization generation failed: {viz_error}")
+            logger.debug(f"[FILE ANALYSIS] Visualization generation failed: {viz_error}")
     
     # Use ResponseComposer to frame the response
     filename_display = first_file_obj.filename if first_file_obj else "uploaded file"
     if tracker:
-        tracker.update(ProgressStep.FORMATTING_RESPONSE, f"Formatting response for {filename_display}")
-        print(f"🔄 [PROGRESS] Formatting response for {filename_display}")
+        tracker.update("formatting", f"Formatting response for {filename_display}")
     
     assistant, artifacts, _ = ResponseComposer.compose_file_response(
         filename=first_file_obj.filename if first_file_obj else "uploaded file",
@@ -3199,6 +3424,44 @@ Return only "complex" or "simple"."""
         intent="summarize_uploaded_file"
     )
     
+    # -----------------------------------------------------------------------
+    # INSIGHT INJECTION — surface top file insights as visible callout blocks
+    # -----------------------------------------------------------------------
+    _file_content_blocks = [block.to_dict() for block in assistant.content]
+    if insights:
+        _priority_map = {"high": "warning", "medium": "info", "low": "info", "critical": "error"}
+        _insight_callouts = [
+            {
+                "type": "callout",
+                "variant": _priority_map.get(ins.get("priority", "low"), "info"),
+                "text": ins.get("description", ""),
+            }
+            for ins in insights[:3]
+            if ins.get("description")
+        ]
+        if _insight_callouts and len(_file_content_blocks) > 1:
+            _file_content_blocks = _file_content_blocks[:-1] + _insight_callouts + [_file_content_blocks[-1]]
+
+    # -----------------------------------------------------------------------
+    # METRIC CARD for structured single-row results
+    # -----------------------------------------------------------------------
+    if struct_result and len(struct_result.rows) == 1 and struct_result.rows[0]:
+        for _col, _val in struct_result.rows[0].items():
+            if isinstance(_val, (int, float)) and _val is not None:
+                _file_content_blocks.insert(1, {
+                    "type": "metric_card",
+                    "label": _col.replace("_", " ").title(),
+                    "value": _val,
+                    "unit": "$" if any(k in _col.lower() for k in ("amount", "revenue", "price", "salary", "balance")) else "",
+                })
+                break
+
+    # -----------------------------------------------------------------------
+    # PAGINATION METADATA
+    # -----------------------------------------------------------------------
+    _file_total = struct_result.row_count if struct_result else len(structured_data_rows)
+    _file_cols = list(structured_data_rows[0].keys()) if structured_data_rows else []
+
     # Build ChatGPT-like response
     response = schemas.LamaResponse(
         id=f"msg_{int(time.time() * 1000)}",
@@ -3209,7 +3472,7 @@ Return only "complex" or "simple"."""
         assistant={
             "role": "assistant",
             "title": assistant.title,
-            "content": [block.to_dict() for block in assistant.content],
+            "content": _file_content_blocks,
         },
         artifacts=artifacts.to_dict(),
         visualizations=schemas.Visualization(**visualizations) if visualizations else None,
@@ -3219,6 +3482,9 @@ Return only "complex" or "simple"."""
             "confidence": 0.95,
         },
         followups=[fu.to_dict() for fu in followups],
+        total_rows=_file_total if _file_total else None,
+        has_more=bool(struct_result and struct_result.is_truncated),
+        column_names=_file_cols if _file_cols else None,
         debug={
             "normalized_user_request": query,
             "requires_date": False,
@@ -3233,7 +3499,7 @@ Return only "complex" or "simple"."""
             "analysis_steps": len(analysis_plan.steps) if analysis_plan else 0,
         }
     )
-    
+
     # For backwards compatibility, wrap in ResponseWrapper with old schema
     return schemas.ResponseWrapper(
         success=True,
@@ -3268,13 +3534,133 @@ async def build_file_lookup_response(
     """
     # Get progress tracker if message_id is provided
     tracker = progress_tracker_manager.get_tracker(message_id) if message_id else None
-    
-    query_preview = query[:40] + "..." if len(query) > 40 else query
-    
+
     if tracker:
-        tracker.update(ProgressStep.ANALYZING_INTENT, f"Searching files: '{query_preview}'")
-        print(f"\n🔄 [PROGRESS] Searching files: '{query_preview}'")
-    
+        # Plan is refined to structured/unstructured once we detect the file type below
+        tracker.set_plan(PLAN_FILE_LOOKUP_UNSTRUCTURED)  # default; overridden if structured
+        tracker.update("routing", f"Searching files: '{query}'")
+
+    # -----------------------------------------------------------------------
+    # STRUCTURED FILE FAST PATH: if the session has CSV/XLSX/XLS files,
+    # query them directly via StructuredFileEngine (NL → pandas).
+    # Falls through to the normal RAG path on any failure.
+    # -----------------------------------------------------------------------
+    try:
+        from sqlalchemy import select as _sa_select
+        from .structured_file_engine import get_structured_file_engine as _get_sfe
+        import io as _io
+
+        _struct_file = (
+            await db.execute(
+                _sa_select(models.UploadedFile)
+                .where(
+                    models.UploadedFile.session_id == session_id,
+                    models.UploadedFile.filetype.like("structured:%"),
+                )
+                .order_by(models.UploadedFile.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+        if _struct_file and _struct_file.content_text:
+            if tracker:
+                tracker.set_plan(PLAN_FILE_LOOKUP_STRUCTURED)
+                tracker.done("routing", f"Found structured file: {_struct_file.filename}")
+                tracker.update("file_lookup", f"Loading {_struct_file.filename}")
+            _sfe = _get_sfe()
+            # Re-parse the stored df.to_string() representation back to a DataFrame
+            import pandas as _pd
+            _df = _pd.read_fwf(_io.StringIO(_struct_file.content_text))
+            if not _df.empty:
+                if tracker:
+                    tracker.update("pandas_query", f"Querying {len(_df)} rows for: '{query}'")
+                _struct_result = await _sfe.query(
+                    df=_df,
+                    user_query=query,
+                    file_id=str(_struct_file.id),
+                    filename=_struct_file.filename or "",
+                    conversation_history=conversation_history,
+                )
+                if _struct_result.rows and not _struct_result.error:
+                    logger.info(
+                        "[FILE_LOOKUP] StructuredFileEngine: %d rows for '%s'",
+                        _struct_result.row_count, query,
+                    )
+                    if tracker:
+                        tracker.done("pandas_query", f"Found {_struct_result.row_count} matching rows")
+                    from .response_composer import ResponseComposer
+                    _followups = await ResponseComposer.generate_dynamic_file_followups(
+                        filename=_struct_file.filename or "uploaded file",
+                        content_preview=_struct_file.content_text[:500],
+                        intent="file_lookup",
+                    )
+                    from .dynamic_visualization_generator import DynamicVisualizationGenerator
+                    _viz = None
+                    try:
+                        _viz = await DynamicVisualizationGenerator.generate_multi_viz(
+                            results=_struct_result.rows,
+                            fields_info=None,
+                        )
+                    except Exception:
+                        pass
+                    import time as _time
+                    _response = schemas.LamaResponse(
+                        id=f"msg_{int(_time.time() * 1000)}",
+                        object="chat.response",
+                        created_at=int(_time.time() * 1000),
+                        session_id=session_id,
+                        mode="file",
+                        assistant={
+                            "role": "assistant",
+                            "title": f"Results from {_struct_file.filename} ({_struct_result.row_count} rows)",
+                            "content": [
+                                {
+                                    "type": "paragraph",
+                                    "text": (
+                                        f"Found {_struct_result.row_count} record(s) in "
+                                        f"**{_struct_file.filename}**."
+                                        + (f" Results truncated to {len(_struct_result.rows)} rows." if _struct_result.is_truncated else "")
+                                    ),
+                                },
+                                *(
+                                    [
+                                        {
+                                            "type": "table",
+                                            "headers": list(_struct_result.rows[0].keys()),
+                                            "rows": [
+                                                [str(r.get(h, "")) for h in _struct_result.rows[0].keys()]
+                                                for r in _struct_result.rows[:10]
+                                            ],
+                                        }
+                                    ]
+                                    if _struct_result.rows
+                                    else []
+                                ),
+                            ],
+                        },
+                        artifacts={
+                            "files_used": [{"filename": _struct_file.filename, "file_id": str(_struct_file.id)}],
+                            "sql": None,
+                        },
+                        visualizations=schemas.Visualization(**_viz) if _viz else None,
+                        routing={"type": "file_lookup", "intent": query, "confidence": 0.9},
+                        followups=[fu.to_dict() for fu in _followups],
+                        debug={
+                            "structured_file_engine": True,
+                            "pandas_code": _struct_result.query_code,
+                            "execution_time_ms": _struct_result.execution_time_ms,
+                            "row_count": _struct_result.row_count,
+                        },
+                    )
+                    return schemas.ResponseWrapper(
+                        success=True,
+                        response=_response,
+                        timestamp=current_timestamp(),
+                        original_query=query,
+                    )
+    except Exception as _sfe_lookup_err:
+        logger.warning("[FILE_LOOKUP] StructuredFileEngine path failed, falling back to RAG: %s", _sfe_lookup_err)
+
     # Retrieve relevant chunks from previously uploaded files
     chunks = await retrieve_relevant_chunks(db, session_id, query)
     
@@ -3283,8 +3669,8 @@ async def build_file_lookup_response(
     
     if tracker:
         match_quality = "high relevance" if len(chunks) >= 3 else "partial match" if chunks else "no matches"
-        tracker.update(ProgressStep.PROCESSING_RESULTS, f"Found {len(chunks)} chunks ({match_quality})")
-        print(f"🔄 [PROGRESS] Found {len(chunks)} chunks ({match_quality})")
+        tracker.done("chunk_retrieval", f"Found {len(chunks)} chunks ({match_quality})")
+        tracker.update("context_analysis", "Analysing retrieved context")
     
     # ============================================================================
     # PHASE 1: RESULT INTERPRETER - ANALYZE RETRIEVED CONTENT
@@ -3293,7 +3679,7 @@ async def build_file_lookup_response(
     
     if chunks and len(chunks) > 0:
         try:
-            print(f"[RESULT_INTERPRETER] Analyzing {len(chunks)} file chunks for insights...")
+            logger.debug(f"[RESULT_INTERPRETER] Analyzing {len(chunks)} file chunks for insights...")
             result_interpreter = get_result_interpreter()
             
             # Convert chunks to structured format for interpretation
@@ -3325,16 +3711,16 @@ async def build_file_lookup_response(
             ]
             
             if insights:
-                print(f"[RESULT_INTERPRETER] Generated {len(insights)} insights for file lookup")
+                logger.debug(f"[RESULT_INTERPRETER] Generated {len(insights)} insights for file lookup")
             
         except Exception as interp_error:
-            print(f"[RESULT_INTERPRETER] Warning: File lookup interpretation failed: {interp_error}")
+            logger.debug(f"[RESULT_INTERPRETER] Warning: File lookup interpretation failed: {interp_error}")
     
     # Generate answer using LLM with conversation context
     if tracker:
         context_len = len(context_text)
         tracker.update(ProgressStep.FORMATTING_RESPONSE, f"Generating answer from {context_len} chars of context")
-        print(f"🔄 [PROGRESS] Generating answer from {context_len} chars of context")
+        logger.debug(f"🔄 [PROGRESS] Generating answer from {context_len} chars of context")
     
     # Build system prompt with context embedded (prevents ASSISTANT: prefix leak)
     system_prompt = (
@@ -3375,7 +3761,7 @@ async def build_file_lookup_response(
     
     response = schemas.FileLookupResponse(
         intent=query,
-        confidence="high" if chunks else "low",
+        confidence=0.90 if chunks else 0.30,
         message=answer or "No relevant information found in uploaded files.",
         related_queries=related_queries,
         metadata={
@@ -3573,11 +3959,9 @@ async def build_standard_response(
     # Get progress tracker if message_id is provided
     tracker = progress_tracker_manager.get_tracker(message_id) if message_id else None
     
-    query_preview = query[:40] + "..." if len(query) > 40 else query
-    
     if tracker:
-        tracker.update(ProgressStep.ANALYZING_INTENT, f"Processing: '{query_preview}'")
-        print(f"\n🔄 [PROGRESS] Processing: '{query_preview}'")
+        tracker.set_plan(PLAN_VARIATIONS)
+        tracker.update("routing", f"Processing: '{query}'")
     
     # Generate multiple response variations like ChatGPT
     from .response_generator import DynamicResponseGenerator, create_conversation_state
@@ -3592,8 +3976,7 @@ async def build_standard_response(
     response_generator = DynamicResponseGenerator()
     
     if tracker:
-        tracker.update(ProgressStep.PROCESSING_RESULTS, "Generating 4 response variations...")
-        print(f"🔄 [PROGRESS] Generating 4 response variations...")
+        tracker.update("response_generation", "Generating response variations")
     
     # Generate 3-4 varied responses
     variations = await response_generator.generate_multiple_responses(
@@ -3612,8 +3995,9 @@ async def build_standard_response(
     answer_len = len(answer)
     
     if tracker:
-        tracker.update(ProgressStep.FORMATTING_RESPONSE, f"Formatting response ({answer_len} chars, {len(variations)} variations)")
-        print(f"🔄 [PROGRESS] Formatting response ({answer_len} chars, {len(variations)} variations)")
+        tracker.done("response_generation", f"Generated {len(variations)} variations")
+        tracker.update("formatting", f"Formatting response ({answer_len} chars)")
+        logger.debug(f"🔄 [PROGRESS] Formatting response ({answer_len} chars, {len(variations)} variations)")
     
     # Use ResponseComposer for ChatGPT-like response framing
     from .response_composer import ResponseComposer

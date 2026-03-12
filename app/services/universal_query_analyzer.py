@@ -175,7 +175,7 @@ class UniversalQueryAnalyzer:
             SemanticAnalysis with all discovered information
         """
         
-        logger.info(f"[ANALYZER] Analyzing query: {user_prompt[:60]}...")
+        logger.info(f"[ANALYZER] Analyzing query: {user_prompt}")
         
         # Step 1: Determine if this is a follow-up
         is_followup = self._is_followup_query(
@@ -203,6 +203,15 @@ class UniversalQueryAnalyzer:
             db
         )
         
+        # CRITICAL FIX: For MAIN_SIMPLE queries, limit to ONE table only
+        # Simple queries like "show me all staff" should NOT discover multiple tables
+        # that could be joined. Only discover one primary table.
+        if query_type == QueryType.MAIN_SIMPLE and len(relevant_tables) > 1:
+            logger.info(f"[ANALYZER] ⚡ MAIN_SIMPLE detected → limiting to primary table only")
+            logger.info(f"[ANALYZER]   Discovered: {[t.table_name for t in relevant_tables]}")
+            logger.info(f"[ANALYZER]   Selected: {relevant_tables[0].table_name} (discarding others)")
+            relevant_tables = [relevant_tables[0]]  # Keep only the most relevant table
+        
         logger.info(f"[ANALYZER] Found {len(relevant_tables)} relevant tables: "
                    f"{[t.table_name for t in relevant_tables]}")
         
@@ -228,12 +237,18 @@ class UniversalQueryAnalyzer:
                    f"Column→Value mappings: {len(col_to_val_mappings)}")
         
         # Step 6: Detect join patterns
-        join_instructions = await self._detect_join_patterns(
-            user_prompt,
-            relevant_tables,
-            previous_query_context,
-            db
-        )
+        # CRITICAL FIX: For MAIN_SIMPLE queries, SKIP join detection entirely
+        # Simple list queries should NEVER add joins unless explicitly requested
+        if query_type == QueryType.MAIN_SIMPLE:
+            logger.info(f"[ANALYZER] ⚡ MAIN_SIMPLE detected → skipping join detection")
+            join_instructions = []  # No joins for simple queries
+        else:
+            join_instructions = await self._detect_join_patterns(
+                user_prompt,
+                relevant_tables,
+                previous_query_context,
+                db
+            )
         
         # Step 7: Extract query patterns (aggregations, filters, sorting, etc.)
         aggregations = self._extract_aggregations(user_prompt)
@@ -279,9 +294,20 @@ class UniversalQueryAnalyzer:
         1. Keywords in prompt (what about, those, that, etc.)
         2. Existence of previous context
         3. Conversation history
+        
+        CRITICAL: If previous_context is explicitly None, this is a strong signal
+        from the arbiter that this is NOT a follow-up, even if there's conversation
+        history. The arbiter has already considered entity changes, standalone patterns,
+        and other signals to make this authoritative decision.
         """
+        # CRITICAL FIX: If previous_context is explicitly None, respect that decision
+        # The arbiter has already determined this is NOT a follow-up
+        if previous_context is None:
+            logger.info(f"[ANALYZER] previous_context is None → treating as MAIN query (arbiter decision)")
+            return False
+        
         # No previous context = must be main query
-        if not previous_context and not conversation_history:
+        if not conversation_history:
             return False
         
         # Check for follow-up keywords
@@ -347,8 +373,19 @@ class UniversalQueryAnalyzer:
         # Check for aggregations
         has_aggregation = any(kw in prompt_lower for kw in self.aggregate_keywords)
         
-        # Check for joins
-        has_join = any(kw in prompt_lower for kw in self.join_keywords)
+        # Check for joins - with context awareness
+        # CRITICAL FIX: "all" by itself is NOT a join indicator - it's too broad
+        # Only treat as join if there are actual join indicators (with, and their, multiple tables, etc.)
+        has_join = False
+        join_indicators = {'with', 'and their', 'and the', 'including', 'plus', 'alongside'}
+        
+        # First check for strong join keywords (not "all")
+        strong_join_keywords = self.join_keywords - {'all', 'match'}  # "all" and "match" are too broad
+        if any(kw in prompt_lower for kw in strong_join_keywords):
+            has_join = True
+        # Only treat "all" or "match" as join if there are explicit join indicators
+        elif ('all' in prompt_lower or 'match' in prompt_lower) and any(ind in prompt_lower for ind in join_indicators):
+            has_join = True
         
         # Check for complex patterns (window functions, CTEs, subqueries)
         has_complex = any(word in prompt_lower for word in 
@@ -392,10 +429,14 @@ class UniversalQueryAnalyzer:
         Discover relevant tables using semantic analysis.
         
         Strategy:
-        1. Extract entity keywords from the prompt (schema-aware)
-        2. Search database for matching tables
-        3. Score by relevance to prompt
-        4. Return ranked list
+        1. For FOLLOW-UPS with previous context: LOCK to previous table
+        2. Extract entity keywords from the prompt (schema-aware)
+        3. Search database for matching tables
+        4. Score by relevance to prompt
+        5. Return ranked list
+        
+        CRITICAL: For follow-up queries, the previous table context MUST dominate.
+        This prevents the analyzer from re-discovering unrelated tables like tool_calls.
         """
         
         try:
@@ -407,14 +448,91 @@ class UniversalQueryAnalyzer:
             logger.error(f"[ANALYZER] Error getting tables: {e}", exc_info=True)
             return []
         
+        # Check for previous context with table info
+        # Support both 'table' (from session_query_handler) and 'table_name' keys
+        primary_table = None
+        if previous_context:
+            primary_table = previous_context.get('table') or previous_context.get('table_name')
+        
+        # CRITICAL FIX: For follow-up queries, LOCK to previous table
+        # Do NOT re-discover tables from scratch when we have valid previous context
+        # BUT ONLY if this is a true follow-up (no entity change)
+        if primary_table and primary_table in all_tables:
+            prompt_lower = user_prompt.lower()
+            
+            # Detect if this is a follow-up with STRONG relative reference
+            # Must have explicit referential words, not just generic query words
+            strong_relative_keywords = {
+                'those', 'them', 'these', 'that', 'same', 
+                'only those', 'among them', 'from these'
+            }
+            
+            # Detect explicit entity mentions that would indicate a NEW query
+            # Build from actual DB tables dynamically
+            try:
+                from app.services.schema_intelligence_service import get_schema_intelligence as _gsi
+                _svc = _gsi()
+                entity_keywords = set(_svc.table_profiles.keys()) if _svc.table_profiles else set()
+                _extras = set()
+                for t in entity_keywords:
+                    if t.endswith('s'):
+                        _extras.add(t[:-1])
+                    else:
+                        _extras.add(t + 's')
+                entity_keywords |= _extras
+            except Exception:
+                entity_keywords = set()
+            
+            import re as _re
+            has_strong_reference = any(kw in prompt_lower for kw in strong_relative_keywords)
+            # Use word-boundary matching so "staffing" does not trigger "staff",
+            # "employees" still matches "employee", etc.
+            has_new_entity = any(
+                _re.search(r'\b' + _re.escape(entity) + r'\b', prompt_lower)
+                for entity in entity_keywords
+            )
+            
+            # Only lock if we have strong reference OR (generic reference without new entity)
+            should_lock = has_strong_reference or (not has_new_entity and any(
+                kw in prompt_lower for kw in {'list', 'show', 'give', 'get', 'all', 'detail'}
+            ))
+            
+            # If there's a strong relative reference and NO new conflicting entity,
+            # LOCK to that table instead of fresh discovery
+            if should_lock and not has_new_entity:
+                logger.info(f"[ANALYZER] 🔒 FOLLOW-UP TABLE LOCK: Using previous table '{primary_table}' (strong relative reference)")
+                
+                # Fetch metadata only for the locked table
+                try:
+                    table_info = await db.run_sync(
+                        self._get_table_info_sync, 
+                        primary_table
+                    )
+                    schema_dict = table_info.get('columns', {})
+                    foreign_keys = table_info.get('foreign_keys', [])
+                    
+                    locked_table = TableMetadata(
+                        table_name=primary_table,
+                        columns=schema_dict,
+                        sample_data={},
+                        foreign_keys=foreign_keys,
+                        relevance_score=1.0  # Maximum relevance for locked table
+                    )
+                    
+                    logger.info(f"[ANALYZER] ✅ Locked to table: {primary_table} (columns={len(schema_dict)})")
+                    return [locked_table]
+                    
+                except Exception as e:
+                    logger.warning(f"[ANALYZER] Could not fetch metadata for locked table {primary_table}: {e}")
+                    # Fall through to normal discovery if lock fails
+            elif has_new_entity:
+                logger.info(f"[ANALYZER] ⚠️ NOT locking to previous table '{primary_table}' - new entity detected in query")
+            else:
+                logger.info(f"[ANALYZER] ⚠️ NOT locking to previous table '{primary_table}' - weak relative reference")
+        
         # Extract entities mentioned in prompt using LLM (ZERO HARDCODING)
         entities = await self._extract_entities(user_prompt, all_tables)
         logger.info(f"[ANALYZER] Extracted entities: {entities}")
-        
-        # If follow-up with previous context, prioritize previous table
-        primary_table = None
-        if previous_context and 'table_name' in previous_context:
-            primary_table = previous_context['table_name']
         
         # Match entities to tables using semantic similarity
         table_matches = []

@@ -181,7 +181,7 @@ class EmbeddingBasedRetriever:
         # Support both k and top_k parameters for backward compatibility
         if top_k is not None:
             k = top_k
-        logger.debug(f"[RETRIEVER] Finding top-{k} tables for: {query[:50]}...")
+        logger.debug(f"[RETRIEVER] Finding top-{k} tables for: {query}")
         
         # ✅ FIXED: Skip embedding model loading - use keyword fallback for now
         # Embedding model loading was causing hangs during queries
@@ -210,20 +210,24 @@ class EmbeddingBasedRetriever:
                     else:
                         # Create minimal metadata object
                         logger.debug(f"[RETRIEVER] Creating minimal metadata for table '{table_name}'")
+                        from app.config import settings as _cfg
+                        _schema = _cfg.postgres_schema
                         class SimpleTableMetadata:
                             def __init__(self, name):
                                 self.name = name
-                                self.full_name = f"genai.{name}"
+                                self.full_name = f"{_schema}.{name}"
                                 self.columns = {}
                                 self.row_count = 0
                                 self.description = f"Table: {name}"
                         table_meta = SimpleTableMetadata(table_name)
                 else:
                     # Fallback
+                    from app.config import settings as _cfg
+                    _schema = _cfg.postgres_schema
                     class SimpleTableMetadata:
                         def __init__(self, name):
                             self.name = name
-                            self.full_name = f"genai.{name}"
+                            self.full_name = f"{_schema}.{name}"
                             self.columns = {}
                             self.row_count = 0
                             self.description = f"Table: {name}"

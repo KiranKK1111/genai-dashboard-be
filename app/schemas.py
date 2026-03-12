@@ -337,7 +337,7 @@ class BaseResponse(BaseModel):
     id: Optional[str] = Field(None, description="Message ID from database (when persisted)")
     type: str = Field(..., description="Type of the response e.g. data_query, file_query")
     intent: str = Field(..., description="High level intent extracted from the query")
-    confidence: Union[float, str] = Field(..., description="Model confidence score")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Model confidence score (0.0–1.0)")
     message: str = Field(..., description="User‑visible explanation of the result")
     related_queries: Optional[List[str]] = Field(
         None, description="Suggestions for follow‑up questions"
@@ -477,12 +477,22 @@ class Visualization(BaseModel):
     
     # Advanced customization (NEW)
     customization: Optional[ChartCustomization] = Field(None, description="Advanced chart customization options")
-    
+
+    # Pre-aggregated data for immediate render (server-side) + raw row count
+    pre_aggregated_data: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Per-view pre-aggregated data {bar:[...], pie:[...], ...} ready to render without client transform"
+    )
+    raw_row_count: Optional[int] = Field(
+        None,
+        description="Total rows before aggregation (for display e.g. 'showing top 10 of 4,832')"
+    )
+
     # Presentation options
     show_raw_data: Optional[bool] = Field(True, description="Show raw data table option")
     exportable: Optional[bool] = Field(True, description="Allow data export")
     full_screen_enabled: Optional[bool] = Field(True, description="Allow full-screen view")
-    
+
     class Config:
         extra = "allow"  # Allow additional dynamic fields
 
@@ -566,7 +576,9 @@ class ConfigUpdateResponse(BaseResponse):
 
 
 class StandardResponse(BaseResponse):
-    type: Literal["standard"] = "standard"
+    # Allow "standard" (default) as well as "clarification" and "viz_update"
+    # which share the same flexible response structure.
+    type: str = "standard"
 
 
 ResponsePayload = Union[
@@ -637,6 +649,21 @@ class SessionsResponse(BaseModel):
 
 
 class NewSessionResponse(BaseModel):
+    success: bool
+    session_id: str
+
+
+class UpdateSessionTitleRequest(BaseModel):
+    title: str
+
+
+class UpdateSessionTitleResponse(BaseModel):
+    success: bool
+    session_id: str
+    title: str
+
+
+class DeleteSessionResponse(BaseModel):
     success: bool
     session_id: str
 
@@ -747,8 +774,13 @@ class IntelligentModalResponse(BaseModel):
 # ----------------------------- ChatGPT-like Response Models ----
 
 class ContentBlock(BaseModel):
-    """Single content block in a response."""
-    type: str = Field(..., description="Block type: paragraph, heading, bullets, numbered, callout, table, code")
+    """Single content block in a response.
+
+    Types:
+      paragraph, heading, bullets, numbered, callout, table, code — standard blocks
+      metric_card — KPI highlight (big number). Uses: value, label, unit, change, change_direction
+    """
+    type: str = Field(..., description="Block type: paragraph, heading, bullets, numbered, callout, table, code, metric_card")
     text: Optional[str] = Field(None, description="Text content")
     items: Optional[List[str]] = Field(None, description="List items (for bullets/numbered)")
     variant: Optional[str] = Field(None, description="Callout variant: info, success, warning, next, error")
@@ -756,6 +788,13 @@ class ContentBlock(BaseModel):
     rows: Optional[List[List[str]]] = Field(None, description="Table rows")
     language: Optional[str] = Field(None, description="Code block language (python, sql, bash, etc.)")
     emoji: Optional[str] = Field(None, description="Emoji for visual appeal")
+
+    # metric_card fields — rendered as a large highlighted KPI number by the frontend
+    value: Optional[Any] = Field(None, description="Numeric value for metric_card blocks")
+    label: Optional[str] = Field(None, description="Short label shown below the value (e.g. 'Total Customers')")
+    unit: Optional[str] = Field(None, description="Unit or currency symbol shown next to the value (e.g. '$', 'ms')")
+    change: Optional[str] = Field(None, description="Change vs prior period shown as badge (e.g. '+12%', '-3')")
+    change_direction: Optional[str] = Field(None, description="Trend direction for badge colour: up | down | neutral")
 
 
 class AssistantMessageBlock(BaseModel):
@@ -799,21 +838,74 @@ class DebugInfo(BaseModel):
     sql_executed: Optional[str] = None
     row_count: Optional[int] = None
     columns: Optional[List[str]] = None
+    result_rows: Optional[List[Dict[str, Any]]] = None  # CRITICAL: Store actual result rows for STEP 9
     
     class Config:
         extra = "allow"
 
 
+# ============================================================================
+# Artifact-centric response architecture (ResponseGeneration.md design)
+# ============================================================================
+
+class AnswerType(str, Enum):
+    """Semantic classification of the query result — deterministic, no LLM."""
+    SINGLE_METRIC = "single_metric"          # COUNT(*) = 1 row, 1 number
+    METRIC_WITH_TABLE = "metric_with_table"  # few rows, few metrics
+    TABULAR_RESULT = "tabular_result"        # multi-row table, no obvious pattern
+    DISTRIBUTION = "distribution"            # grouped by category + metric
+    TREND = "trend"                          # grouped by time + metric
+    RANKING = "ranking"                      # ordered by metric DESC
+    COMPARISON = "comparison"                # multiple categories + multiple metrics
+    DETAIL_RECORDS = "detail_records"        # raw row-level detail (no aggregation)
+    DOCUMENT_SUMMARY = "document_summary"    # file / RAG summary
+    DOCUMENT_QA = "document_qa"             # file / RAG Q&A
+    CHAT_RESPONSE = "chat_response"          # conversational answer
+    ERROR = "error"                          # error response
+
+
+class ColumnMeta(BaseModel):
+    """Rich metadata for a single result column."""
+    name: str
+    label: Optional[str] = None
+    datatype: str                          # "number", "string", "date", "boolean"
+    semantic_role: Optional[str] = None   # metric, dimension, time, category, identifier, text, currency, percentage
+    format_hint: Optional[str] = None     # currency, percentage, integer, decimal, date, datetime
+    nullable: bool = True
+
+
+class DataPayload(BaseModel):
+    """Structured data payload with semantic column metadata."""
+    kind: str = "sql_result"              # sql_result | file_table | document_extract | chat_context | none
+    columns: List[ColumnMeta] = Field(default_factory=list)
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    row_count: int = 0
+    truncated: bool = False
+    total_available_rows: Optional[int] = None
+    preview_only: bool = False
+
+
+class ExecutionMeta(BaseModel):
+    """Execution-layer metadata."""
+    sql: Optional[str] = None
+    sql_safe: bool = True
+    limit_applied: bool = False
+    execution_time_ms: Optional[int] = None
+    sources: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
 class LamaResponse(BaseModel):
     """
     Unified ChatGPT-like response format.
-    
+
     Combines:
     - Conversational assistant message with content blocks
     - Structured artifacts and routing
     - Single visualization (multi_viz by default)
     - Follow-up suggestions
     - Debug information
+    - NEW: Contextual suggested questions and actions (Question-Back Engine)
     """
     id: str = Field(..., description="Response ID (e.g., msg_...)")
     object: str = Field(default="chat.response", description="Object type")
@@ -827,7 +919,49 @@ class LamaResponse(BaseModel):
     routing: RoutingInfo = Field(..., description="Routing and intent info")
     followups: List[FollowUpSuggestion] = Field(default_factory=list, description="Follow-up suggestions")
     variations: Optional[List[str]] = Field(None, description="Alternative response variations (ChatGPT-style)")
+    
+    # Pagination / dataset summary — helps frontend show "Showing 10 of 4,832 rows" and "Load more"
+    total_rows: Optional[int] = Field(None, description="Total rows in the result set before any truncation/limit")
+    has_more: bool = Field(False, description="True when the displayed rows are a subset of total_rows")
+    column_names: Optional[List[str]] = Field(None, description="Column names of the primary dataset (for quick access without parsing the table block)")
+
+    # NEW: Production-grade contextual suggestions (Question-Back Engine)
+    suggested_questions: List[str] = Field(default_factory=list, description="Contextual follow-up questions generated by Question-Back Engine")
+    suggested_actions: List[Dict[str, Any]] = Field(default_factory=list, description="Actionable UI elements (expand_limit, add_filter, create_chart, etc.)")
+
+    # Clarification block — populated when mode=="clarification"
+    clarification: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Structured clarification request when the query is ambiguous. "
+            "Contains: ambiguity_types, questions (list of structured question objects), "
+            "reasoning, can_proceed."
+        ),
+    )
+
     debug: Optional[DebugInfo] = Field(None, description="Debug information")
+
+    # ── Artifact-centric fields (ResponseGeneration.md architecture) ──────────
+    answer_type: Optional[str] = Field(
+        None,
+        description="Semantic answer type: single_metric, trend, distribution, tabular_result, etc."
+    )
+    data: Optional[DataPayload] = Field(
+        None,
+        description="Structured data payload with semantic column metadata"
+    )
+    render_artifacts: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Ordered list of renderable UI artifact blocks (stat_card, table, bar_chart, etc.)"
+    )
+    clarifications: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Structured clarification requests (e.g. chart axis mapping ambiguity)"
+    )
+    execution_meta: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Execution metadata: sql, limit_applied, execution_time_ms, warnings"
+    )
 
 
 # ============================================================================

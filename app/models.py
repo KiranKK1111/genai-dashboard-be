@@ -10,8 +10,8 @@ that work across multiple databases (PostgreSQL, MySQL, SQLite, SQL Server).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import List
 
 from sqlalchemy import (
     Column,
@@ -82,7 +82,7 @@ class User(Base):
     id = get_uuid_column(primary_key=True)
     username = Column(String(255), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     sessions: Mapped[List["ChatSession"]] = relationship(
         "ChatSession", back_populates="user", cascade="all, delete-orphan"
@@ -95,8 +95,12 @@ class ChatSession(Base):
 
     id = get_uuid_column(primary_key=True)
     user_id = Column(Uuid(as_uuid=True), ForeignKey(get_fk_reference("users"), ondelete="CASCADE"), nullable=False)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
-    
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    # Auto-updated on every write — used for sorting and last_updated in session list
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    # User-editable display name (ChatGPT-style rename)
+    title = Column(String(255), nullable=True)
+
     # ===== NEW: Session state management (ChatGPT-like follow-ups) =====
     # Persisted QueryState from the last executed query
     session_state = Column(JSON, nullable=True)  # Structured query state
@@ -135,7 +139,7 @@ class Message(Base):
     
     # User input
     query = Column(Text, nullable=False)  # The user's query
-    queried_at = Column(DateTime(timezone=True), default=datetime.utcnow)  # When query was received
+    queried_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))  # When query was received
     
     # Assistant output
     response_type = Column(String(50), nullable=False)  # 'modal_response', 'confirmation_response', 'clarifying_question', 'error_response'
@@ -146,7 +150,7 @@ class Message(Base):
     feedback = Column(Text, nullable=True)  # User's feedback (thumbs up/down, comments, etc.)
     
     # Timestamp tracking (updated when feedback is added/modified)
-    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     session: Mapped["ChatSession"] = relationship("ChatSession", back_populates="messages")
 
@@ -160,7 +164,7 @@ class UploadedFile(Base):
     filename = Column(String(512), nullable=False)
     filetype = Column(String(255), nullable=False)
     size = Column(Integer, nullable=False)
-    upload_time = Column(DateTime(timezone=True), default=datetime.utcnow)
+    upload_time = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     content_text = Column(Text)  # extracted plain text for semantic search
 
     session: Mapped["ChatSession"] = relationship("ChatSession", back_populates="files")
@@ -208,7 +212,7 @@ class FileChunk(Base):
     user_id = Column(Uuid(as_uuid=True), ForeignKey(get_fk_reference("users"), ondelete="CASCADE"), nullable=True)
     
     # Timestamps
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), nullable=True)
 
     file: Mapped["UploadedFile"] = relationship("UploadedFile", back_populates="chunks")
@@ -249,11 +253,11 @@ class ToolCall(Base):
     error_message = Column(Text, nullable=True)
     
     # Timing
-    start_time = Column(DateTime(timezone=True), default=datetime.utcnow)
+    start_time = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     end_time = Column(DateTime(timezone=True), nullable=True)
     
     # Metadata
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     session: Mapped["ChatSession"] = relationship("ChatSession", back_populates="tool_calls")
 
@@ -311,7 +315,7 @@ class TurnState(Base):
     confidence = Column(Float, default=0.5)
     
     # Timestamp
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     
     session: Mapped["ChatSession"] = relationship("ChatSession")
 
@@ -365,7 +369,7 @@ class QueryEmbedding(Base):
         embedding = Column(JSON, nullable=False)
     
     # Timestamps
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     
     # Metadata for tracking
     query_hash = Column(String(64), nullable=True)  # SHA256 of user_query for duplicate detection
@@ -425,7 +429,37 @@ class ConversationMemory(Base):
     last_summarization_at = Column(DateTime(timezone=True), nullable=True)
     
     # Timestamps
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
-    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
+    session: Mapped["ChatSession"] = relationship("ChatSession")
+
+# ============================================================================
+# Session History — archived turns for long-running sessions
+# ============================================================================
+
+class SessionHistory(Base):
+    """
+    Archives old message turns from chat_sessions.session_state once a session
+    exceeds SESSION_MAX_LIVE_TURNS.  The live session keeps only the most recent
+    SESSION_ARCHIVE_KEEP_TURNS turns; older ones are moved here.
+
+    This prevents session_state JSON from growing unbounded and slowing queries.
+    """
+    __tablename__ = "session_history"
+    __table_args__ = ({"schema": get_schema()},)
+
+    id = get_uuid_column(primary_key=True)
+    session_id = Column(
+        Uuid(as_uuid=True),
+        ForeignKey(get_fk_reference("chat_sessions"), ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Archived turn data (same structure as session_state entries)
+    turn_index = Column(Integer, nullable=False)          # original turn position in session
+    turn_data = Column(JSON, nullable=False)              # full turn payload
+    archived_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
     session: Mapped["ChatSession"] = relationship("ChatSession")

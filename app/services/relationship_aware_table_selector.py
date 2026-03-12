@@ -326,7 +326,7 @@ class RelationshipAwareTableSelector:
         }
 
         logger.info(
-            f"[SELECTOR] Query: {user_query[:50]}... "
+            f"[SELECTOR] Query: {user_query} "
             f"→ Primary: {primary}, Related: {related}"
         )
 

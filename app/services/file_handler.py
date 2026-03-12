@@ -55,30 +55,22 @@ def normalize_mime_type(mime_type: str | None) -> str:
 
 async def extract_text_from_binary_file(data: bytes, filename: str) -> str:
     """
-    Extract text from binary file formats (DOCX, XLSX, PDF, etc).
-    
+    Extract text from supported binary file formats (XLSX, XLS, PDF, CSV).
+
+    DOCX and other unsupported formats are rejected at the route layer before
+    reaching this function, so no DOCX handling is needed here.
+
     Args:
         data: File binary data
         filename: Original filename for type detection
-        
+
     Returns:
         Extracted text content
     """
     filename_lower = filename.lower()
-    
-    # DOCX files
-    if filename_lower.endswith('.docx'):
-        try:
-            from docx import Document
-            doc = Document(io.BytesIO(data))
-            text = '\n'.join([paragraph.text for paragraph in doc.paragraphs])
-            return text if text.strip() else "[DOCX file with no extractable text]"
-        except Exception as e:
-            logger.warning(f"Failed to extract text from DOCX: {e}")
-            return "[Error extracting DOCX content]"
-    
+
     # XLSX/XLS files
-    elif filename_lower.endswith(('.xlsx', '.xls')):
+    if filename_lower.endswith(('.xlsx', '.xls')):
         try:
             import pandas as pd
             df = pd.read_excel(io.BytesIO(data))
@@ -179,14 +171,24 @@ async def add_file(
         The persisted UploadedFile instance.
     """
     import logging
+    from pathlib import Path as _Path
     logger = logging.getLogger(__name__)
     logger.info(f"[ADD_FILE] Processing file upload: {file.filename}, session: {session_id}")
     content_text, chunks, embeddings, file_size = await process_file_upload(file)
     logger.info(f"[ADD_FILE] Extracted text length: {len(content_text)}, chunks: {len(chunks)}, embeddings: {len(embeddings)}, file size: {file_size} bytes")
+
+    # Classify file as structured (CSV/XLSX/XLS) or unstructured (PDF/JSON/TXT)
+    _STRUCTURED_EXTS = {".csv", ".xlsx", ".xls"}
+    _ext = _Path(file.filename or "").suffix.lower()
+    _file_category = "structured" if _ext in _STRUCTURED_EXTS else "unstructured"
+    # Encode category into filetype field so query routing can use it later
+    _mime = normalize_mime_type(file.content_type)
+    _effective_filetype = f"{_file_category}:{_mime}"
+
     new_file = models.UploadedFile(
         session_id=session_id,
         filename=file.filename,
-        filetype=normalize_mime_type(file.content_type),
+        filetype=_effective_filetype,
         size=file_size,
         content_text=content_text,
     )

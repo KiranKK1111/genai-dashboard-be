@@ -109,7 +109,7 @@ class ContextChainManager:
         chain.append(node)
         
         logger.info(
-            f"[CONTEXT-CHAIN] Added query '{user_query[:40]}...' "
+            f"[CONTEXT-CHAIN] Added query '{user_query}' "
             f"(depth={len(chain)}, parent={parent_id[:8] if parent_id else 'NONE'}, "
             f"followup={followup_type})"
         )
@@ -257,7 +257,7 @@ class ContextChainManager:
             indent = "  " * i
             followup_indicator = f" [{node.followup_type}]" if node.followup_type else ""
             summary += (
-                f"{indent}Q{i+1}: {node.user_query[:60]}...{followup_indicator}\n"
+                f"{indent}Q{i+1}: {node.user_query}{followup_indicator}\n"
                 f"{indent}   Table: {node.table_name}, "
                 f"Rows: {node.result_count}, "
                 f"Filters: {len(node.filters)}\n"
@@ -284,7 +284,7 @@ class ContextChainManager:
         for i, node in enumerate(chain):
             context += f"\n[Query {i+1}]\n"
             context += f"User: {node.user_query}\n"
-            context += f"Generated SQL: {node.generated_sql[:150]}...\n"
+            context += f"Generated SQL: {node.generated_sql}\n"
             context += f"Table: {node.table_name}\n"
             context += f"Result rows: {node.result_count}\n"
             

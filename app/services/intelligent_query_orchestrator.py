@@ -152,7 +152,7 @@ class IntelligentQueryOrchestrator:
             result.sql_patterns = sql_metadata.get('patterns', [])
             result.sql_complexity = sql_metadata.get('complexity', 'unknown')
             result.reasoning += f"\n✅ Generated {result.sql_complexity} SQL using patterns: {', '.join(result.sql_patterns)}"
-            logger.info(f"[ORCH-STEP3] ✅ SQL: {sql_query[:100]}...")
+            logger.info(f"[ORCH-STEP3] ✅ SQL: {sql_query}")
             
             # STEP 4: EXECUTION
             logger.info("[ORCH-STEP4] ⚡ EXECUTION")
@@ -349,7 +349,7 @@ class IntelligentQueryOrchestrator:
         """STEP 4: Execute generated SQL and return results."""
         
         try:
-            logger.debug(f"[EXECUTION] Executing: {sql_query[:100]}...")
+            logger.debug(f"[EXECUTION] Executing: {sql_query}")
             
             # Execute query
             result = await db.execute(sa.text(sql_query))
